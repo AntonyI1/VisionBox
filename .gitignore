@@ -1,0 +1,61 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Learning docs (personal reference, not for repo)
+docs/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch / ML
+*.pt
+*.pth
+*.onnx
+*.weights
+models/weights/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Saved clips/recordings (will be large)
+recordings/
+clips/
