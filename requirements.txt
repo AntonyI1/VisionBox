@@ -1,0 +1,17 @@
+# Core ML
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+
+# Computer vision
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Tracking
+scipy>=1.10.0
+
+# Model downloads
+huggingface_hub>=0.20.0
+
+# Utilities
+python-dotenv>=1.0.0

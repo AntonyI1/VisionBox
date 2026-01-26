@@ -3,7 +3,7 @@
 venv/
 env/
 
-# Learning docs (personal reference, not for repo)
+# Dev notes (personal reference)
 docs/
 
 # Python
@@ -28,12 +28,14 @@ wheels/
 .installed.cfg
 *.egg
 
-# PyTorch / ML
+# PyTorch / ML models (downloaded via setup script)
 *.pt
 *.pth
 *.onnx
 *.weights
-models/weights/
+models/*.pt
+models/*.onnx
+models/.cache/
 
 # IDE
 .idea/
@@ -55,6 +57,10 @@ htmlcov/
 *.log
 logs/
 
-# Saved clips/recordings (will be large)
+# Recordings (large files)
 recordings/
 clips/
+output/
+
+# Environment
+.env
