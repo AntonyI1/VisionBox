@@ -3,9 +3,9 @@
 venv/
 env/
 
-# Learning docs (personal reference, not for repo)
-docs/
+# Dev notes (personal reference)
 CLAUDE.md
+docs/
 
 # Python
 __pycache__/
@@ -29,12 +29,14 @@ wheels/
 .installed.cfg
 *.egg
 
-# PyTorch / ML
+# PyTorch / ML models (downloaded via setup script)
 *.pt
 *.pth
 *.onnx
 *.weights
-models/weights/
+models/*.pt
+models/*.onnx
+models/.cache/
 
 # IDE
 .idea/
@@ -56,6 +58,10 @@ htmlcov/
 *.log
 logs/
 
-# Saved clips/recordings (will be large)
+# Recordings (large files)
 recordings/
 clips/
+output/
+
+# Environment
+.env
