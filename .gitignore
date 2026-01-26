@@ -62,5 +62,9 @@ recordings/
 clips/
 output/
 
+# Training data and outputs
+datasets/
+runs/
+
 # Environment
 .env
