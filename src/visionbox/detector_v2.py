@@ -167,17 +167,19 @@ class MultiModelDetector:
         ])
 
 
-def create_surveillance_detector(device: str = 'cuda') -> MultiModelDetector:
+def create_surveillance_detector(device: str = 'cuda', use_custom_bottle: bool = True) -> MultiModelDetector:
     """
     Create a detector optimized for surveillance use cases.
 
     Loads:
     - YOLOv8n for COCO classes (person, car, dog, etc.)
     - License plate model
+    - Custom bottle model (fine-tuned for insulated bottles/tumblers)
 
     Class ID mapping:
     - 0-79: COCO classes
     - 80: License plate
+    - 81: Bottle (custom fine-tuned)
     """
     models_dir = Path(__file__).parent.parent.parent / 'models'
 
@@ -197,11 +199,20 @@ def create_surveillance_detector(device: str = 'cuda') -> MultiModelDetector:
             path=str(lp_model),
             class_offset=80,  # License plate = class 80
             class_names={0: 'license_plate'},
-            conf_threshold=0.3  # Slightly higher threshold for plates
+            conf_threshold=0.3
         ))
-        print(f"License plate model found: {lp_model}")
-    else:
-        print(f"License plate model not found at {lp_model}")
+        print(f"License plate model: {lp_model.name}")
+
+    # Add custom bottle model if available
+    bottle_model = models_dir / 'bottle-custom.pt'
+    if bottle_model.exists() and use_custom_bottle:
+        configs.append(ModelConfig(
+            path=str(bottle_model),
+            class_offset=81,  # Custom bottle = class 81
+            class_names={0: 'bottle'},
+            conf_threshold=0.3
+        ))
+        print(f"Custom bottle model: {bottle_model.name}")
 
     return MultiModelDetector(configs, device=device)
 
@@ -225,7 +236,7 @@ CLASS_PRESETS_V2 = {
     ],
     'indoor': [
         0,   # person
-        39,  # bottle
+        39,  # bottle (COCO)
         41,  # cup
         56,  # chair
         57,  # couch
@@ -239,6 +250,7 @@ CLASS_PRESETS_V2 = {
         67,  # cell phone
         73,  # book
         74,  # clock
+        81,  # bottle (custom - Yeti/insulated)
     ],
     'vehicles': [
         1,   # bicycle
