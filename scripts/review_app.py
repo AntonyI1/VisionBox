@@ -131,14 +131,23 @@ with tab_review:
             "No captures to review. Run detect_and_capture.py to collect detections."
         )
     else:
-        # Class selector
+        # Class selector — persists across reruns so reject/approve
+        # doesn't jump to a different class
+        if 'selected_class' not in st.session_state:
+            st.session_state.selected_class = classes[0]
+        if st.session_state.selected_class not in classes:
+            st.session_state.selected_class = classes[0]
+
         col_select, col_stats = st.columns([2, 3])
         with col_select:
             selected_class = st.selectbox(
                 "Class",
                 classes,
-                format_func=lambda c: f"{c.replace('_', ' ')} ({len(get_crops(c))})"
+                index=classes.index(st.session_state.selected_class),
+                format_func=lambda c: f"{c.replace('_', ' ')} ({len(get_crops(c))})",
+                key="class_selector"
             )
+            st.session_state.selected_class = selected_class
         with col_stats:
             st.write("")  # spacing
             for cls in classes:
