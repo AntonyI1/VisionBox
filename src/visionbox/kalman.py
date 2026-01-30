@@ -69,13 +69,18 @@ class KalmanBoxTracker:
             [0, 0, 0, 1, 0, 0, 0, 0],
         ], dtype=float)
 
-        # Process noise: how much we expect state to randomly change
-        # Higher = model is less trusted, adapts faster to observations
-        self.Q = np.diag([1, 1, 1, 1, 0.01, 0.01, 0.0001, 0.0001])
+        # Process noise: how much we expect state to randomly change.
+        # Higher = model is less trusted, adapts faster to observations.
+        # Tuned for surveillance: people/vehicles change direction often,
+        # and at 5 FPS detection the filter coasts for 6 frames between
+        # updates — needs higher velocity uncertainty to avoid overconfident
+        # predictions that drift from reality.
+        self.Q = np.diag([10, 10, 10, 10, 50, 50, 1, 1])
 
-        # Measurement noise: how much we trust detections
-        # Lower = trust detections more
-        self.R = np.diag([1, 1, 10, 10])  # trust position more than size
+        # Measurement noise: how much we trust detections.
+        # Lower = trust detections more.
+        # YOLO bounding box centers are more accurate than sizes.
+        self.R = np.diag([5, 5, 15, 15])
 
         # Track metadata
         self.id = KalmanBoxTracker.count

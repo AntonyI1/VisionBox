@@ -16,10 +16,11 @@ from ultralytics import YOLO
 @dataclass
 class ModelConfig:
     """Configuration for a detection model."""
-    path: str                    # Model path or name (e.g., 'yolov8n.pt')
+    path: str                    # Model path or name (e.g., 'yolov8s.pt')
     class_offset: int = 0        # Offset to add to class IDs (for multi-model merging)
     class_names: dict = None     # Override class names {id: name}
     conf_threshold: float = 0.25
+    class_conf: dict = None      # Per-class confidence overrides {class_id: threshold}
 
 
 class MultiModelDetector:
@@ -51,27 +52,36 @@ class MultiModelDetector:
     def __init__(
         self,
         model_configs: list[ModelConfig] = None,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        imgsz: int = 640
     ):
         """
         Initialize multi-model detector.
 
         Args:
             model_configs: List of ModelConfig for each model to load.
-                          If None, loads default YOLOv8n.
+                          If None, loads default YOLOv8s.
             device: 'cuda' or 'cpu'
+            imgsz: Model input size. 640 for close range, 1280 for 4MP outdoor.
         """
         self.device = device if torch.cuda.is_available() else 'cpu'
+        self.imgsz = imgsz
 
         if model_configs is None:
-            model_configs = [ModelConfig('yolov8n.pt')]
+            model_configs = [ModelConfig('yolov8s.pt')]
 
         self.models: list[tuple[YOLO, ModelConfig]] = []
         self.class_names: dict[int, str] = {}
 
         for config in model_configs:
-            model = YOLO(config.path)
-            model.to(self.device)
+            # Prefer TensorRT engine if available (2-3x faster)
+            engine_path = Path(config.path).with_suffix('.engine')
+            if engine_path.exists():
+                model = YOLO(str(engine_path))
+                print(f"  Using TensorRT engine: {engine_path.name}")
+            else:
+                model = YOLO(config.path)
+                model.to(self.device)
             self.models.append((model, config))
 
             # Build unified class name mapping
@@ -115,7 +125,10 @@ class MultiModelDetector:
             conf = config.conf_threshold if config.conf_threshold else conf_threshold
 
             # Run inference (ultralytics handles preprocessing)
-            results = model(frame, conf=conf, iou=iou_threshold, verbose=False)
+            # half=True enables FP16 on CUDA for ~1.5-2x speedup
+            use_half = self.device != 'cpu'
+            results = model(frame, conf=conf, iou=iou_threshold, verbose=False,
+                            half=use_half, imgsz=self.imgsz)
 
             # Extract detections
             for result in results:
@@ -134,6 +147,12 @@ class MultiModelDetector:
                     # Filter by class if specified
                     if classes is not None and unified_class_id not in classes:
                         continue
+
+                    # Per-class confidence threshold
+                    if config.class_conf:
+                        min_conf = config.class_conf.get(orig_class_id, conf)
+                        if conf_score < min_conf:
+                            continue
 
                     all_detections.append({
                         'box': [int(box[0]), int(box[1]), int(box[2]), int(box[3])],
@@ -165,6 +184,17 @@ class MultiModelDetector:
             [*d['box'], d['confidence'], d['class_id']]
             for d in detections
         ])
+
+
+def export_tensorrt(model_name: str = 'yolov8s.pt', imgsz: int = 1280):
+    """Export a YOLO model to TensorRT FP16 engine for faster inference.
+
+    Run once: python -c "from visionbox.detector_v2 import export_tensorrt; export_tensorrt()"
+    Creates yolov8s.engine in the same directory.
+    """
+    model = YOLO(model_name)
+    model.export(format='engine', half=True, imgsz=imgsz)
+    print(f"Exported {model_name} → TensorRT FP16 engine (imgsz={imgsz})")
 
 
 def create_surveillance_detector(device: str = 'cuda', use_custom_bottle: bool = True) -> MultiModelDetector:
@@ -229,10 +259,9 @@ CLASS_PRESETS_V2 = {
         14,  # bird
         15,  # cat
         16,  # dog
-        24,  # backpack
-        26,  # handbag
-        28,  # suitcase
         80,  # license_plate
+        # Excluded: backpack(24), handbag(26), suitcase(28) — COCO model
+        # constantly misidentifies outdoor objects as these classes
     ],
     'indoor': [
         0,   # person
