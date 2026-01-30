@@ -132,11 +132,13 @@ class Tracker:
         self,
         max_age: int = 30,      # frames to keep unmatched track alive
         min_hits: int = 3,      # hits required before track is confirmed
-        iou_threshold: float = 0.3
+        iou_threshold: float = 0.3,
+        max_coast: int = 30     # frames to show track without fresh detection
     ):
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
+        self.max_coast = max_coast
         self.tracks: list[KalmanBoxTracker] = []
 
     def update(self, detections: np.ndarray) -> np.ndarray:
@@ -174,12 +176,14 @@ class Tracker:
             if t.time_since_update <= self.max_age
         ]
 
-        # Step 6: Return confirmed tracks only
+        # Step 6: Return confirmed tracks
         results = []
         for track in self.tracks:
-            # Only report tracks that have been seen enough times
-            # AND were updated recently (not just coasting on prediction)
-            if track.hits >= self.min_hits and track.time_since_update == 0:
+            # Show tracks that have been confirmed (enough detections)
+            # and haven't been lost for too long.
+            # Between detection frames, Kalman predicts position — this
+            # keeps boxes visible and smooth instead of flickering.
+            if track.hits >= self.min_hits and track.time_since_update <= self.max_coast:
                 bbox = track.get_state()
                 results.append([*bbox, track.id])
 
