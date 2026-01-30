@@ -58,10 +58,17 @@ htmlcov/
 *.log
 logs/
 
-# Recordings (large files)
+# Recordings and captures (large files)
 recordings/
+captures/
 clips/
 output/
+
+# TensorRT engines (GPU-specific, not portable)
+*.engine
+
+# Windows Zone.Identifier streams (WSL artifact)
+*:Zone.Identifier
 
 # Training data and outputs
 datasets/
