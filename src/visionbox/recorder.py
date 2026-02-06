@@ -69,7 +69,7 @@ class EventRecorder:
         self,
         output_dir: str = 'recordings/events',
         cooldown: float = 10.0,
-        fps: float = 20.0,
+        fps: float = 15.0,
         codec: str = 'mp4v',
     ):
         self.output_dir = Path(output_dir)

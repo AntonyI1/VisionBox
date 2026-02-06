@@ -25,6 +25,7 @@ import cv2
 import time
 import json
 import threading
+import subprocess
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -38,6 +39,16 @@ from visionbox import (
 )
 from visionbox.detector_v2 import MultiModelDetector, ModelConfig
 from visionbox.recorder import EventRecorder
+
+def open_browser(url: str):
+    """Open URL in Windows browser from WSL2."""
+    try:
+        subprocess.Popen(
+            ['cmd.exe', '/c', 'start', url.replace('&', '^&')],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
 
 np.random.seed(42)
 COLORS = [(int(c[0]), int(c[1]), int(c[2])) for c in np.random.randint(0, 255, (100, 3))]
@@ -105,12 +116,12 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 with MJPEGHandler.frame_lock:
                     frame = MJPEGHandler.latest_frame
                 if frame is not None:
-                    _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                     self.wfile.write(b'--frame\r\n')
                     self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
                     self.wfile.write(jpeg.tobytes())
                     self.wfile.write(b'\r\n')
-                time.sleep(0.05)
+                time.sleep(0.067)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -259,14 +270,14 @@ def main():
                         help='Upper bound for uncertain detections')
     parser.add_argument('--uncertain-interval', type=float, default=5.0,
                         help='Min seconds between uncertain captures')
-    parser.add_argument('--no-display', action='store_true',
+    parser.add_argument('--no-display', action='store_true', default=True,
                         help='Run headless (no window)')
-    parser.add_argument('--web', action='store_true',
+    parser.add_argument('--web', action='store_true', default=True,
                         help='Stream processed feed to browser (http://localhost:8085)')
     parser.add_argument('--web-port', type=int, default=8085,
                         help='Web viewer port (default: 8085)')
-    parser.add_argument('--max-fps', type=int, default=30,
-                        help='Max loop FPS (default: 30)')
+    parser.add_argument('--max-fps', type=int, default=15,
+                        help='Max loop FPS (default: 15)')
     parser.add_argument('--detect-fps', type=int, default=5,
                         help='Object detection FPS (default: 5, Frigate standard)')
     args = parser.parse_args()
@@ -305,20 +316,32 @@ def main():
         [ModelConfig('yolov8s.pt', class_conf=class_conf)],
         device=device, imgsz=1280
     )
-    # Tuned for 5 FPS detection on 30 FPS loop:
-    # - max_age=150: keep lost tracks 5 seconds (30fps * 5s)
+    # Tuned for 5 FPS detection on 15 FPS loop:
+    # - max_age=75: keep lost tracks 5 seconds (15fps * 5s)
     # - min_hits=2: confirm after 2 detections (400ms at 5 FPS detect)
     # - iou_threshold=0.2: looser matching compensates for Kalman drift
-    # - max_coast=30: show Kalman predictions for 1 second between detections
-    tracker = Tracker(max_age=150, min_hits=2, iou_threshold=0.2, max_coast=30)
+    # - max_coast=15: show Kalman predictions for 1 second between detections
+    tracker = Tracker(max_age=75, min_hits=2, iou_threshold=0.2, max_coast=15)
     motion = MotionDetector(min_area=args.min_area)
     recorder = EventRecorder(cooldown=args.cooldown)
     print(f"Model loaded ({device})")
+
+    streamlit_proc = None
 
     # Start web viewer
     if args.web:
         start_web_viewer(args.web_port)
         print(f"\n  Web viewer: http://localhost:{args.web_port}")
+        open_browser(f'http://localhost:{args.web_port}')
+
+    # Start Streamlit review app (only if web mode enabled)
+    if args.web:
+        streamlit_proc = subprocess.Popen(
+            ['streamlit', 'run', 'scripts/review_app.py', '--server.headless', 'true'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print(f"  Review app: http://localhost:8501")
+        open_browser('http://localhost:8501')
 
     print(f"\nSurveillance settings:")
     print(f"  Mode: {args.mode}")
@@ -376,7 +399,7 @@ def main():
             full_h, full_w = frame.shape[:2]
 
             # Downscale for motion detection (CPU, cheap, every frame)
-            proc_w = 960
+            proc_w = 640
             scale = proc_w / full_w
             proc_h = int(full_h * scale)
             proc_frame = cv2.resize(frame, (proc_w, proc_h))
@@ -549,10 +572,10 @@ def main():
                                (0, 0, 255), -1)
 
                 if args.web:
-                    # Scale to 1280px wide for browser
-                    scale = 1280 / display.shape[1]
+                    # Scale to 1920px wide for browser
+                    scale = 1920 / display.shape[1]
                     web_h = int(display.shape[0] * scale)
-                    web_frame = cv2.resize(display, (1280, web_h))
+                    web_frame = cv2.resize(display, (1920, web_h))
                     update_web_frame(web_frame)
 
                 if not args.no_display:
@@ -586,6 +609,8 @@ def main():
         recorder.release()
         cap.release()
         cv2.destroyAllWindows()
+        if streamlit_proc:
+            streamlit_proc.terminate()
 
         if classes_seen:
             with open(DATASET_DIR / 'classes.txt', 'w') as f:
