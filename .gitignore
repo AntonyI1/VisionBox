@@ -67,6 +67,9 @@ output/
 # TensorRT engines (GPU-specific, not portable)
 *.engine
 
+# OpenVINO IR models (exported per-machine)
+*_openvino_model/
+
 # Windows Zone.Identifier streams (WSL artifact)
 *:Zone.Identifier
 
