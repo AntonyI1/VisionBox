@@ -1,0 +1,50 @@
+camera:
+  url: ${CAMERA_URL}
+  # test_input: test_input.mp4  # Uncomment to use a test video
+
+detection:
+  mode: outdoor
+  confidence: 0.20
+  detect_fps: 8
+  model: yolov8n.pt
+  imgsz: 640
+  class_conf:
+    0: 0.25    # person
+    2: 0.20    # car
+    5: 0.30    # bus
+    7: 0.30    # truck
+    14: 0.50   # bird
+    15: 0.40   # cat
+    16: 0.40   # dog
+
+motion:
+  min_area: 500
+
+tracker:
+  max_age: 75
+  min_hits: 1
+  iou_threshold: 0.2
+  max_coast: 15
+
+recording:
+  output_dir: recordings
+  clean:
+    enabled: true
+  annotated:
+    enabled: true
+    fps: 15.0
+    cooldown: 10.0
+  retention:
+    days: 14
+    check_interval: 3600
+
+capture:
+  interval: 10.0
+  uncertain_low: 0.3
+  uncertain_high: 0.6
+  uncertain_interval: 5.0
+
+display:
+  web: true
+  web_port: 8085
+  max_fps: 30
