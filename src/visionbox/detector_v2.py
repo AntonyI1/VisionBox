@@ -1,90 +1,54 @@
-"""
-Multi-model detector using YOLOv8/v11 via Ultralytics.
-
-Supports loading multiple models and merging their detections.
-Each model can detect different classes (e.g., COCO + license plates).
-"""
+"""Multi-model YOLO detector with auto backend selection (TensorRT > OpenVINO > PyTorch)."""
 
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import torch
 from ultralytics import YOLO
+
+
+def _has_cuda() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
 
 
 @dataclass
 class ModelConfig:
-    """Configuration for a detection model."""
-    path: str                    # Model path or name (e.g., 'yolov8s.pt')
-    class_offset: int = 0        # Offset to add to class IDs (for multi-model merging)
-    class_names: dict = None     # Override class names {id: name}
+    path: str
+    class_offset: int = 0
+    class_names: dict = None
     conf_threshold: float = 0.25
-    class_conf: dict = None      # Per-class confidence overrides {class_id: threshold}
+    class_conf: dict = None
 
 
 class MultiModelDetector:
-    """
-    Detector that runs multiple YOLO models and merges results.
-
-    Example:
-        detector = MultiModelDetector([
-            ModelConfig('yolov8n.pt'),  # COCO classes 0-79
-            ModelConfig('models/license-plate.pt', class_offset=80),  # License plate = 80
-        ])
-        detections = detector.detect(frame)
-    """
-
-    # Standard COCO class names (80 classes)
-    COCO_NAMES = [
-        'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
-        'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
-        'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
-        'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
-        'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
-        'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
-        'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
-        'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
-        'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator',
-        'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
-    ]
-
     def __init__(
         self,
         model_configs: list[ModelConfig] = None,
-        device: str = 'cuda',
+        device: str = 'auto',
         imgsz: int = 640
     ):
-        """
-        Initialize multi-model detector.
-
-        Args:
-            model_configs: List of ModelConfig for each model to load.
-                          If None, loads default YOLOv8s.
-            device: 'cuda' or 'cpu'
-            imgsz: Model input size. 640 for close range, 1280 for 4MP outdoor.
-        """
-        self.device = device if torch.cuda.is_available() else 'cpu'
+        self.device = self._resolve_device(device)
         self.imgsz = imgsz
 
         if model_configs is None:
-            model_configs = [ModelConfig('yolov8s.pt')]
+            model_configs = [ModelConfig('yolov8n.pt')]
 
         self.models: list[tuple[YOLO, ModelConfig]] = []
         self.class_names: dict[int, str] = {}
 
         for config in model_configs:
-            # Prefer TensorRT engine if available (2-3x faster)
-            engine_path = Path(config.path).with_suffix('.engine')
-            if engine_path.exists():
-                model = YOLO(str(engine_path))
-                print(f"  Using TensorRT engine: {engine_path.name}")
-            else:
-                model = YOLO(config.path)
+            model_path = self._find_best_model(config.path)
+            model = YOLO(model_path, task='detect')
+
+            if model_path.endswith('.pt') and self.device != 'cpu':
                 model.to(self.device)
+
             self.models.append((model, config))
 
-            # Build unified class name mapping
             for orig_id, name in model.names.items():
                 unified_id = orig_id + config.class_offset
                 if config.class_names and orig_id in config.class_names:
@@ -92,8 +56,33 @@ class MultiModelDetector:
                 else:
                     self.class_names[unified_id] = name
 
+            print(f"  Loaded: {Path(model_path).name} ({len(model.names)} classes)")
+
         print(f"Loaded {len(self.models)} model(s) on {self.device}")
         print(f"Total classes: {len(self.class_names)}")
+
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        if device == 'auto':
+            return 'cuda' if _has_cuda() else 'cpu'
+        return device
+
+    @staticmethod
+    def _find_best_model(path: str) -> str:
+        p = Path(path)
+        engine = p.with_suffix('.engine')
+        if engine.exists():
+            print(f"  Using TensorRT: {engine.name}")
+            return str(engine)
+        openvino_dir = p.with_name(p.stem + '_openvino_model')
+        if openvino_dir.is_dir():
+            print(f"  Using OpenVINO: {openvino_dir.name}")
+            return str(openvino_dir)
+        models_openvino = Path('models') / (p.stem + '_openvino_model')
+        if models_openvino.is_dir():
+            print(f"  Using OpenVINO: {models_openvino}")
+            return str(models_openvino)
+        return path
 
     def detect(
         self,
@@ -102,53 +91,32 @@ class MultiModelDetector:
         iou_threshold: float = 0.45,
         classes: list[int] = None
     ) -> list[dict]:
-        """
-        Run detection on a frame using all loaded models.
-
-        Args:
-            frame: BGR image (numpy array)
-            conf_threshold: Minimum confidence (can be overridden per-model)
-            iou_threshold: NMS IoU threshold
-            classes: Filter to specific class IDs (unified IDs)
-
-        Returns:
-            List of detections, each with:
-            - box: [x1, y1, x2, y2]
-            - confidence: float
-            - class_id: int (unified across all models)
-            - class_name: str
-        """
         all_detections = []
 
         for model, config in self.models:
-            # Use model-specific threshold if set, otherwise use global
             conf = config.conf_threshold if config.conf_threshold else conf_threshold
-
-            # Run inference (ultralytics handles preprocessing)
-            # half=True enables FP16 on CUDA for ~1.5-2x speedup
-            use_half = self.device != 'cpu'
+            use_half = self.device not in ('cpu', 'auto')
             results = model(frame, conf=conf, iou=iou_threshold, verbose=False,
                             half=use_half, imgsz=self.imgsz)
 
-            # Extract detections
             for result in results:
                 boxes = result.boxes
                 if boxes is None or len(boxes) == 0:
                     continue
 
-                for i in range(len(boxes)):
-                    box = boxes.xyxy[i].cpu().numpy()
-                    conf_score = float(boxes.conf[i].cpu())
-                    orig_class_id = int(boxes.cls[i].cpu())
+                xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, 'cpu') else np.array(boxes.xyxy)
+                confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else np.array(boxes.conf)
+                clss = boxes.cls.cpu().numpy() if hasattr(boxes.cls, 'cpu') else np.array(boxes.cls)
 
-                    # Apply class offset for unified IDs
+                for i in range(len(boxes)):
+                    box = xyxy[i]
+                    conf_score = float(confs[i])
+                    orig_class_id = int(clss[i])
                     unified_class_id = orig_class_id + config.class_offset
 
-                    # Filter by class if specified
                     if classes is not None and unified_class_id not in classes:
                         continue
 
-                    # Per-class confidence threshold
                     if config.class_conf:
                         min_conf = config.class_conf.get(orig_class_id, conf)
                         if conf_score < min_conf:
@@ -170,124 +138,51 @@ class MultiModelDetector:
         iou_threshold: float = 0.45,
         classes: list[int] = None
     ) -> np.ndarray:
-        """
-        Run detection and return as numpy array for tracker.
-
-        Returns:
-            Array of shape (N, 6): [x1, y1, x2, y2, confidence, class_id]
-        """
+        """Returns (N, 6) array: [x1, y1, x2, y2, confidence, class_id]."""
         detections = self.detect(frame, conf_threshold, iou_threshold, classes)
         if not detections:
             return np.empty((0, 6))
-
-        return np.array([
-            [*d['box'], d['confidence'], d['class_id']]
-            for d in detections
-        ])
+        return np.array([[*d['box'], d['confidence'], d['class_id']] for d in detections])
 
 
 def export_tensorrt(model_name: str = 'yolov8s.pt', imgsz: int = 1280):
-    """Export a YOLO model to TensorRT FP16 engine for faster inference.
-
-    Run once: python -c "from visionbox.detector_v2 import export_tensorrt; export_tensorrt()"
-    Creates yolov8s.engine in the same directory.
-    """
     model = YOLO(model_name)
     model.export(format='engine', half=True, imgsz=imgsz)
     print(f"Exported {model_name} → TensorRT FP16 engine (imgsz={imgsz})")
 
 
-def create_surveillance_detector(device: str = 'cuda', use_custom_bottle: bool = True) -> MultiModelDetector:
-    """
-    Create a detector optimized for surveillance use cases.
+def export_openvino(model_name: str = 'yolov8n.pt', imgsz: int = 640):
+    model = YOLO(model_name)
+    model.export(format='openvino', imgsz=imgsz, half=False)
+    print(f"Exported {model_name} → OpenVINO IR (imgsz={imgsz})")
 
-    Loads:
-    - YOLOv8n for COCO classes (person, car, dog, etc.)
-    - License plate model
-    - Custom bottle model (fine-tuned for insulated bottles/tumblers)
 
-    Class ID mapping:
-    - 0-79: COCO classes
-    - 80: License plate
-    - 81: Bottle (custom fine-tuned)
-    """
+def create_surveillance_detector(device: str = 'auto') -> MultiModelDetector:
+    """Create multi-model detector: COCO + license plate + bottle (if available)."""
     models_dir = Path(__file__).parent.parent.parent / 'models'
 
-    configs = [
-        # Main COCO model
-        ModelConfig(
-            path='yolov8n.pt',
-            class_offset=0,
-            conf_threshold=0.25
-        ),
-    ]
+    configs = [ModelConfig(path='yolov8n.pt', class_offset=0, conf_threshold=0.25)]
 
-    # Add license plate model if available
     lp_model = models_dir / 'license-plate-finetune-v1n.pt'
     if lp_model.exists():
         configs.append(ModelConfig(
-            path=str(lp_model),
-            class_offset=80,  # License plate = class 80
-            class_names={0: 'license_plate'},
-            conf_threshold=0.3
+            path=str(lp_model), class_offset=80,
+            class_names={0: 'license_plate'}, conf_threshold=0.3
         ))
-        print(f"License plate model: {lp_model.name}")
 
-    # Add custom bottle model if available
     bottle_model = models_dir / 'bottle-custom.pt'
-    if bottle_model.exists() and use_custom_bottle:
+    if bottle_model.exists():
         configs.append(ModelConfig(
-            path=str(bottle_model),
-            class_offset=81,  # Custom bottle = class 81
-            class_names={0: 'bottle'},
-            conf_threshold=0.3
+            path=str(bottle_model), class_offset=81,
+            class_names={0: 'bottle'}, conf_threshold=0.3
         ))
-        print(f"Custom bottle model: {bottle_model.name}")
 
     return MultiModelDetector(configs, device=device)
 
 
-# Convenience class presets for filtering
 CLASS_PRESETS_V2 = {
-    'outdoor': [
-        0,   # person
-        1,   # bicycle
-        2,   # car
-        3,   # motorcycle
-        5,   # bus
-        7,   # truck
-        14,  # bird
-        15,  # cat
-        16,  # dog
-        80,  # license_plate
-        # Excluded: backpack(24), handbag(26), suitcase(28) — COCO model
-        # constantly misidentifies outdoor objects as these classes
-    ],
-    'indoor': [
-        0,   # person
-        39,  # bottle (COCO)
-        41,  # cup
-        56,  # chair
-        57,  # couch
-        59,  # bed
-        60,  # dining table
-        62,  # tv
-        63,  # laptop
-        64,  # mouse
-        65,  # remote
-        66,  # keyboard
-        67,  # cell phone
-        73,  # book
-        74,  # clock
-        81,  # bottle (custom - Yeti/insulated)
-    ],
-    'vehicles': [
-        1,   # bicycle
-        2,   # car
-        3,   # motorcycle
-        5,   # bus
-        7,   # truck
-        80,  # license_plate
-    ],
-    'all': None  # No filtering
+    'outdoor': [0, 1, 2, 3, 5, 7, 14, 15, 16, 80],
+    'indoor': [0, 39, 41, 56, 57, 59, 60, 62, 63, 64, 65, 66, 67, 73, 74, 81],
+    'vehicles': [1, 2, 3, 5, 7, 80],
+    'all': None,
 }
