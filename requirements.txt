@@ -1,21 +1,17 @@
-# Core ML
-torch>=2.0.0
-torchvision>=0.15.0
+# Core ML (CPU)
 ultralytics>=8.0.0
+openvino>=2024.0.0
 
 # Computer vision
-opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
 numpy>=1.24.0
 
 # Tracking
 scipy>=1.10.0
 
-# Model downloads
-huggingface_hub>=0.20.0
+# Web
+flask>=3.0.0
 
 # Utilities
 python-dotenv>=1.0.0
-
-# Review GUI
-streamlit>=1.30.0
-pillow>=10.0.0
+pyyaml>=6.0
