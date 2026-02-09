@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VisionBox</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <h1>VisionBox</h1>
+        <nav>
+            <button class="nav-btn active" data-view="live">Live</button>
+            <button class="nav-btn" data-view="events">Events</button>
+            <button class="nav-btn" data-view="zones">Zones</button>
+            <button class="nav-btn" data-view="review">Review</button>
+        </nav>
+        <div id="status-bar">
+            <span id="status-dot" class="dot idle"></span>
+            <span id="status-text">IDLE</span>
+            <span id="status-fps">-- FPS</span>
+            <span id="status-events">0 events</span>
+            <span id="status-storage"></span>
+            <span id="status-uptime"></span>
+        </div>
+    </header>
+
+    <main>
+        <section id="view-live" class="view active">
+            <div class="stream-container">
+                <img id="live-stream" src="/api/stream" alt="Live stream">
+            </div>
+        </section>
+
+        <section id="view-events" class="view">
+            <div id="events-grid" class="events-grid"></div>
+            <div id="events-empty" class="empty-state" style="display:none">
+                No events recorded yet.
+            </div>
+            <button id="load-more" class="load-more-btn" style="display:none">Load More</button>
+        </section>
+
+        <section id="view-zones" class="view">
+            <div class="zones-layout">
+                <div class="zone-canvas-wrap">
+                    <canvas id="zone-canvas"></canvas>
+                    <div id="zone-hint" class="zone-hint">Click to place points. Click near the first point to close the polygon.</div>
+                </div>
+                <div class="zone-sidebar">
+                    <h3>Zones</h3>
+                    <div id="zone-list" class="zone-list"></div>
+                    <button id="zone-add-btn" class="zone-add-btn">+ Add Zone</button>
+                    <div id="zone-form" class="zone-form" style="display:none">
+                        <input id="zone-name" type="text" placeholder="Zone name" maxlength="32">
+                        <div class="zone-type-toggle">
+                            <button class="zone-type-btn active" data-type="include">Include</button>
+                            <button class="zone-type-btn" data-type="exclude">Exclude</button>
+                        </div>
+                        <div class="zone-form-actions">
+                            <button id="zone-save-btn" class="zone-save-btn" disabled>Save</button>
+                            <button id="zone-cancel-btn" class="zone-cancel-btn">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="view-review" class="view">
+            <div class="review-layout">
+                <div class="review-controls">
+                    <select id="review-class-select">
+                        <option value="">Select class...</option>
+                    </select>
+                    <span id="review-progress" class="review-progress"></span>
+                </div>
+                <div class="review-image-wrap">
+                    <img id="review-image" alt="">
+                    <div id="review-empty" class="empty-state">Select a class to start reviewing crops.</div>
+                </div>
+                <div id="review-meta" class="review-meta"></div>
+                <div class="review-actions">
+                    <button id="review-reject" class="review-btn reject" title="Reject (R)">Reject</button>
+                    <button id="review-skip" class="review-btn skip" title="Skip (→)">Skip</button>
+                    <button id="review-approve" class="review-btn approve" title="Approve (A)">Approve</button>
+                </div>
+                <div class="review-shortcuts">A approve · R reject · ← prev · → skip</div>
+            </div>
+        </section>
+    </main>
+
+    <div id="modal-overlay" class="modal-overlay" style="display:none">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 id="modal-title">Event Detail</h2>
+                <button id="modal-close" class="modal-close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="video-container">
+                    <video id="modal-video" controls preload="metadata"></video>
+                    <div class="clip-toggle">
+                        <button class="clip-btn active" data-type="annotated">Annotated</button>
+                        <button class="clip-btn" data-type="clean">Clean</button>
+                    </div>
+                </div>
+                <div id="modal-meta" class="event-meta"></div>
+            </div>
+            <div class="modal-footer">
+                <button id="modal-delete" class="delete-btn">Delete Event</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
