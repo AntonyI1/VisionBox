@@ -260,7 +260,13 @@ def create_app(state: PipelineState) -> Flask:
         _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         return Response(jpeg.tobytes(), mimetype='image/jpeg')
 
-    # --- Review endpoints ---
+    # --- Helpers ---
+
+    def _safe_path(base: Path, *parts: str) -> Path:
+        resolved = (base / Path(*parts)).resolve()
+        if not resolved.is_relative_to(base.resolve()):
+            abort(400)
+        return resolved
 
     def _parse_crop_filename(filename):
         """Parse track{id}_{YYYYMMDD}_{HHMMSS}_{confidence}.jpg"""
@@ -284,8 +290,8 @@ def create_app(state: PipelineState) -> Flask:
             'confidence': round(confidence, 2),
         }
 
-    def _list_crops(class_name):
-        class_dir = state.crops_dir / class_name
+    def _list_images(base_dir: Path, class_name: str):
+        class_dir = _safe_path(base_dir, class_name)
         if not class_dir.is_dir():
             return []
         return sorted(
@@ -313,7 +319,7 @@ def create_app(state: PipelineState) -> Flask:
     @app.route('/api/review/<class_name>')
     def review_crop(class_name):
         offset = request.args.get('offset', 0, type=int)
-        files = _list_crops(class_name)
+        files = _list_images(state.crops_dir, class_name)
         if not files:
             return jsonify({'total': 0, 'offset': offset, 'crop': None})
 
@@ -330,18 +336,18 @@ def create_app(state: PipelineState) -> Flask:
 
     @app.route('/api/review/<class_name>/<filename>/image')
     def review_image(class_name, filename):
-        path = state.crops_dir / class_name / filename
+        path = _safe_path(state.crops_dir, class_name, filename)
         if not path.is_file():
             abort(404)
         return send_file(str(path), mimetype='image/jpeg')
 
     @app.route('/api/review/<class_name>/<filename>/approve', methods=['POST'])
     def review_approve(class_name, filename):
-        src = state.crops_dir / class_name / filename
+        src = _safe_path(state.crops_dir, class_name, filename)
         if not src.is_file():
             abort(404)
 
-        dest_dir = state.training_dir / class_name
+        dest_dir = _safe_path(state.training_dir, class_name)
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / filename
         shutil.move(str(src), str(dest))
@@ -350,13 +356,66 @@ def create_app(state: PipelineState) -> Flask:
 
     @app.route('/api/review/<class_name>/<filename>/reject', methods=['POST'])
     def review_reject(class_name, filename):
-        src = state.crops_dir / class_name / filename
+        src = _safe_path(state.crops_dir, class_name, filename)
         if not src.is_file():
             abort(404)
 
         src.unlink()
         logger.info('Rejected %s/%s (deleted)', class_name, filename)
         return jsonify({'action': 'rejected', 'file': filename})
+
+    # --- Training endpoints ---
+
+    @app.route('/api/training/classes')
+    def training_classes():
+        tdir = state.training_dir
+        if not tdir.is_dir():
+            return jsonify([])
+        classes = []
+        for d in sorted(tdir.iterdir()):
+            if not d.is_dir():
+                continue
+            count = sum(
+                1 for f in d.iterdir()
+                if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
+            )
+            if count > 0:
+                classes.append({'name': d.name, 'count': count})
+        return jsonify(classes)
+
+    @app.route('/api/training/<class_name>')
+    def training_image(class_name):
+        offset = request.args.get('offset', 0, type=int)
+        files = _list_images(state.training_dir, class_name)
+        if not files:
+            return jsonify({'total': 0, 'offset': offset, 'image': None})
+
+        offset = max(0, min(offset, len(files) - 1))
+        filename = files[offset]
+        meta = _parse_crop_filename(filename) or {}
+        meta['filename'] = filename
+        meta['class'] = class_name
+        return jsonify({
+            'total': len(files),
+            'offset': offset,
+            'image': meta,
+        })
+
+    @app.route('/api/training/<class_name>/<filename>/image')
+    def training_serve_image(class_name, filename):
+        path = _safe_path(state.training_dir, class_name, filename)
+        if not path.is_file():
+            abort(404)
+        return send_file(str(path), mimetype='image/jpeg')
+
+    @app.route('/api/training/<class_name>/<filename>', methods=['DELETE'])
+    def training_delete(class_name, filename):
+        path = _safe_path(state.training_dir, class_name, filename)
+        if not path.is_file():
+            abort(404)
+        path.unlink()
+        logger.info('Deleted training image %s/%s', class_name, filename)
+        return jsonify({'deleted': filename})
 
     return app
 

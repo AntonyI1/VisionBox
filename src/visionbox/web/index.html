@@ -14,6 +14,7 @@
             <button class="nav-btn" data-view="events">Events</button>
             <button class="nav-btn" data-view="zones">Zones</button>
             <button class="nav-btn" data-view="review">Review</button>
+            <button class="nav-btn" data-view="training">Training</button>
         </nav>
         <div id="status-bar">
             <span id="status-dot" class="dot idle"></span>
@@ -67,23 +68,49 @@
 
         <section id="view-review" class="view">
             <div class="review-layout">
-                <div class="review-controls">
+                <div class="review-header">
                     <select id="review-class-select">
                         <option value="">Select class...</option>
                     </select>
                     <span id="review-progress" class="review-progress"></span>
                 </div>
-                <div class="review-image-wrap">
-                    <img id="review-image" alt="">
-                    <div id="review-empty" class="empty-state">Select a class to start reviewing crops.</div>
+                <div class="review-card">
+                    <div class="review-image-wrap">
+                        <img id="review-image" alt="">
+                        <div id="review-empty" class="empty-state">Select a class to start reviewing crops.</div>
+                    </div>
+                    <div id="review-meta" class="review-meta"></div>
                 </div>
-                <div id="review-meta" class="review-meta"></div>
                 <div class="review-actions">
                     <button id="review-reject" class="review-btn reject" title="Reject (R)">Reject</button>
                     <button id="review-skip" class="review-btn skip" title="Skip (→)">Skip</button>
                     <button id="review-approve" class="review-btn approve" title="Approve (A)">Approve</button>
                 </div>
                 <div class="review-shortcuts">A approve · R reject · ← prev · → skip</div>
+            </div>
+        </section>
+
+        <section id="view-training" class="view">
+            <div class="review-layout">
+                <div class="review-header">
+                    <select id="training-class-select">
+                        <option value="">Select class...</option>
+                    </select>
+                    <span id="training-progress" class="review-progress"></span>
+                </div>
+                <div class="review-card">
+                    <div class="review-image-wrap">
+                        <img id="training-image" alt="">
+                        <div id="training-empty" class="empty-state">Select a class to browse approved crops.</div>
+                    </div>
+                    <div id="training-meta" class="review-meta"></div>
+                </div>
+                <div class="review-actions">
+                    <button id="training-prev" class="review-btn skip" title="Previous (←)">Prev</button>
+                    <button id="training-delete" class="review-btn reject" title="Delete (D)">Delete</button>
+                    <button id="training-next" class="review-btn skip" title="Next (→)">Next</button>
+                </div>
+                <div class="review-shortcuts">← prev · → next · D delete</div>
             </div>
         </section>
     </main>
