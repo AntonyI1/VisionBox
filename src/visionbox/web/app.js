@@ -57,6 +57,9 @@
             } else if (view === 'review') {
                 liveStream.src = '';
                 loadReviewClasses();
+            } else if (view === 'training') {
+                liveStream.src = '';
+                loadTrainingClasses();
             }
         });
     });
@@ -347,6 +350,133 @@
             if (reviewOffset > 0) {
                 reviewOffset--;
                 loadReviewCrop();
+            }
+        }
+    });
+
+    // Training
+    const trainingClassSelect = document.getElementById('training-class-select');
+    const trainingImage = document.getElementById('training-image');
+    const trainingEmpty = document.getElementById('training-empty');
+    const trainingMeta = document.getElementById('training-meta');
+    const trainingProgress = document.getElementById('training-progress');
+    let trainingClass = '';
+    let trainingOffset = 0;
+    let trainingTotal = 0;
+
+    function loadTrainingClasses() {
+        fetch('/api/training/classes')
+            .then(r => r.json())
+            .then(classes => {
+                trainingClassSelect.innerHTML = '<option value="">Select class...</option>';
+                classes.forEach(c => {
+                    const opt = document.createElement('option');
+                    opt.value = c.name;
+                    opt.textContent = c.name + ' (' + c.count + ')';
+                    trainingClassSelect.appendChild(opt);
+                });
+                if (trainingClass) {
+                    trainingClassSelect.value = trainingClass;
+                }
+            });
+    }
+
+    trainingClassSelect.addEventListener('change', () => {
+        trainingClass = trainingClassSelect.value;
+        trainingOffset = 0;
+        if (trainingClass) {
+            loadTrainingImage();
+        } else {
+            clearTraining();
+        }
+    });
+
+    function loadTrainingImage() {
+        if (!trainingClass) return;
+        fetch('/api/training/' + encodeURIComponent(trainingClass) + '?offset=' + trainingOffset)
+            .then(r => r.json())
+            .then(data => {
+                trainingTotal = data.total;
+                if (!data.image || data.total === 0) {
+                    clearTraining();
+                    trainingProgress.textContent = 'No images';
+                    loadTrainingClasses();
+                    return;
+                }
+                trainingOffset = data.offset;
+                const img = data.image;
+                trainingImage.src = '/api/training/' + encodeURIComponent(trainingClass) +
+                    '/' + encodeURIComponent(img.filename) + '/image';
+                trainingImage.dataset.filename = img.filename;
+                trainingImage.style.display = 'block';
+                trainingEmpty.style.display = 'none';
+                trainingProgress.textContent = (trainingOffset + 1) + ' of ' + trainingTotal;
+
+                let meta = '';
+                if (img.track_id != null) meta += metaRow('Track', '#' + img.track_id);
+                if (img.confidence != null) meta += metaRow('Confidence', Math.round(img.confidence * 100) + '%');
+                if (img.timestamp) meta += metaRow('Time', formatTime(img.timestamp));
+                trainingMeta.innerHTML = meta;
+            });
+    }
+
+    function clearTraining() {
+        trainingImage.style.display = 'none';
+        trainingImage.src = '';
+        trainingImage.dataset.filename = '';
+        trainingEmpty.style.display = 'block';
+        trainingMeta.innerHTML = '';
+        trainingProgress.textContent = '';
+    }
+
+    function deleteTrainingImage() {
+        const filename = trainingImage.dataset.filename;
+        if (!filename || !trainingClass) return;
+        if (!confirm('Permanently delete this training image?')) return;
+
+        fetch('/api/training/' + encodeURIComponent(trainingClass) + '/' +
+            encodeURIComponent(filename), { method: 'DELETE' })
+            .then(r => r.json())
+            .then(() => {
+                trainingTotal--;
+                if (trainingTotal <= 0) {
+                    clearTraining();
+                    trainingProgress.textContent = 'No images';
+                    loadTrainingClasses();
+                    return;
+                }
+                if (trainingOffset >= trainingTotal) trainingOffset = trainingTotal - 1;
+                loadTrainingImage();
+            });
+    }
+
+    document.getElementById('training-delete').addEventListener('click', deleteTrainingImage);
+    document.getElementById('training-prev').addEventListener('click', () => {
+        if (trainingOffset > 0) {
+            trainingOffset--;
+            loadTrainingImage();
+        }
+    });
+    document.getElementById('training-next').addEventListener('click', () => {
+        if (trainingOffset < trainingTotal - 1) {
+            trainingOffset++;
+            loadTrainingImage();
+        }
+    });
+
+    document.addEventListener('keydown', e => {
+        if (currentView !== 'training') return;
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+        if (e.key === 'd' || e.key === 'D') deleteTrainingImage();
+        else if (e.key === 'ArrowRight') {
+            if (trainingOffset < trainingTotal - 1) {
+                trainingOffset++;
+                loadTrainingImage();
+            }
+        } else if (e.key === 'ArrowLeft') {
+            if (trainingOffset > 0) {
+                trainingOffset--;
+                loadTrainingImage();
             }
         }
     });
