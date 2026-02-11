@@ -6,6 +6,7 @@
     let eventsOffset = 0;
     let eventsTotal = 0;
     let modalEventId = null;
+    let isOffline = false;
 
     // Zone editor state
     let zones = [];
@@ -29,10 +30,14 @@
     const modalVideo = document.getElementById('modal-video');
     const modalMeta = document.getElementById('modal-meta');
     const liveStream = document.getElementById('live-stream');
+    const offlineMsg = document.getElementById('offline-msg');
+
+    liveStream.onerror = () => { liveStream.style.display = 'none'; };
 
     // Navigation
     document.querySelectorAll('.nav-btn').forEach(btn => {
         btn.addEventListener('click', () => {
+            if (btn.classList.contains('disabled')) return;
             const view = btn.dataset.view;
             if (view === currentView) return;
 
@@ -45,7 +50,7 @@
             currentView = view;
 
             if (view === 'live') {
-                liveStream.src = '/api/stream';
+                if (!isOffline) liveStream.src = '/api/stream';
             } else if (view === 'events') {
                 liveStream.src = '';
                 eventsOffset = 0;
@@ -78,6 +83,14 @@
                         ' / ' + data.storage.disk_total_human;
                 }
                 statusUptime.textContent = formatUptime(data.uptime);
+
+                if (data.state === 'offline' && !isOffline) {
+                    isOffline = true;
+                    liveStream.src = '';
+                    liveStream.style.display = 'none';
+                    offlineMsg.style.display = 'flex';
+                    document.querySelector('.nav-btn[data-view="zones"]').classList.add('disabled');
+                }
             })
             .catch(() => {});
     }

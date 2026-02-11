@@ -34,6 +34,9 @@ class PipelineState:
     start_time: float = field(default_factory=time.time)
     crops_dir: Path = field(default_factory=lambda: Path('/mnt/storage/visionbox/captures/crops'))
     training_dir: Path = field(default_factory=lambda: Path('/mnt/storage/visionbox/datasets/training'))
+    offline: bool = False
+    db: RecordingDatabase | None = None
+    output_dir: Path | None = None
 
 
 def create_app(state: PipelineState) -> Flask:
@@ -44,16 +47,26 @@ def create_app(state: PipelineState) -> Flask:
     )
 
     def _db() -> RecordingDatabase:
+        if state.db:
+            return state.db
         return state.recording_mgr.db
 
     def _output_dir() -> Path:
+        if state.output_dir:
+            return state.output_dir.resolve()
         return state.recording_mgr.output_dir.resolve()
 
-    def _get_storage_info(mgr) -> dict:
-        out = mgr.output_dir.resolve() if mgr else Path('.')
+    def _get_storage_info() -> dict:
+        if state.output_dir:
+            out = state.output_dir.resolve()
+        elif state.recording_mgr:
+            out = state.recording_mgr.output_dir.resolve()
+        else:
+            out = Path('.')
         recordings_bytes = sum(
             f.stat().st_size for f in out.rglob('*') if f.is_file()
         ) if out.exists() else 0
+        mgr = state.recording_mgr
         max_gb = mgr.config.retention.max_storage_gb if mgr else 0
         if max_gb > 0:
             budget_bytes = int(max_gb * 1024 * 1024 * 1024)
@@ -83,6 +96,9 @@ def create_app(state: PipelineState) -> Flask:
 
     @app.route('/api/stream')
     def stream():
+        if state.offline:
+            abort(503)
+
         def generate():
             while True:
                 with state.frame_lock:
@@ -107,7 +123,18 @@ def create_app(state: PipelineState) -> Flask:
     @app.route('/api/status')
     def status():
         mgr = state.recording_mgr
-        storage = _get_storage_info(mgr)
+        storage = _get_storage_info()
+        if state.offline:
+            db = _db()
+            return jsonify({
+                'recording': False,
+                'state': 'offline',
+                'fps': 0,
+                'frame_count': 0,
+                'event_count': db.get_event_count() if db else 0,
+                'uptime': round(time.time() - state.start_time),
+                'storage': storage,
+            })
         return jsonify({
             'recording': mgr.is_recording if mgr else False,
             'state': mgr.state.value if mgr else 'idle',
