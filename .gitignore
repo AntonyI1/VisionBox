@@ -77,5 +77,8 @@ output/
 datasets/
 runs/
 
+# Zone config (camera-specific)
+zones.json
+
 # Environment
 .env
