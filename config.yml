@@ -9,10 +9,10 @@ detection:
   model: yolov8n.pt
   imgsz: 640
   class_conf:
-    0: 0.25    # person
-    2: 0.20    # car
-    5: 0.30    # bus
-    7: 0.30    # truck
+    0: 0.50    # person
+    2: 0.35    # car
+    5: 0.35    # bus
+    7: 0.35    # truck
     14: 0.50   # bird
     15: 0.40   # cat
     16: 0.40   # dog
@@ -22,12 +22,12 @@ motion:
 
 tracker:
   max_age: 75
-  min_hits: 1
+  min_hits: 2
   iou_threshold: 0.2
   max_coast: 15
 
 recording:
-  output_dir: recordings
+  output_dir: /mnt/storage/visionbox/recordings
   clean:
     enabled: true
   annotated:
@@ -35,11 +35,14 @@ recording:
     fps: 15.0
     cooldown: 10.0
   retention:
-    days: 14
+    days: 30
+    max_storage_gb: 1000
     check_interval: 3600
+    max_per_label: 0  # 0 = unlimited
+    priority_labels: [person]
 
 capture:
-  interval: 10.0
+  interval: 3.0
   uncertain_low: 0.3
   uncertain_high: 0.6
   uncertain_interval: 5.0
