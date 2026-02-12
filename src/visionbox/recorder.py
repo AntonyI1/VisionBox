@@ -1,20 +1,11 @@
-"""
-Event-based video recorder with state machine.
+"""Event-based video recorder with state machine.
 
-Records video clips only when events (motion/detections) occur.
-Uses a cooldown to avoid flickery start/stop behavior:
-
-    IDLE → motion detected → RECORDING → motion stops → COOLDOWN → IDLE
-                                ↑                          │
-                                └── motion resumes ────────┘
-
-Each event produces:
-- Video clip (.mp4)
-- Metadata JSON (start time, duration, detections seen)
+State: IDLE → RECORDING → COOLDOWN → IDLE
 """
 
-import cv2
 import json
+import shutil
+import subprocess
 import time
 import numpy as np
 from enum import Enum
@@ -31,7 +22,6 @@ class RecorderState(Enum):
 
 @dataclass
 class EventMetadata:
-    """Metadata for a recorded event clip."""
     start_time: str = ""
     end_time: str = ""
     duration_seconds: float = 0.0
@@ -44,42 +34,29 @@ class EventMetadata:
             return
         self.detection_count += len(dets)
         self.max_objects_in_frame = max(self.max_objects_in_frame, len(dets))
-        # Log unique classes seen
         for d in dets:
             cls = d.get('class_name', d.get('class', 'unknown'))
             conf = d.get('confidence', 0)
             entry = {'class': cls, 'confidence': round(conf, 3)}
-            if entry not in self.detections[-10:]:  # avoid massive logs
+            if entry not in self.detections[-10:]:
                 self.detections.append(entry)
 
 
 class EventRecorder:
-    """
-    Records video clips triggered by motion/detection events.
-
-    Args:
-        output_dir: Where to save clips and metadata.
-        cooldown: Seconds to keep recording after last trigger.
-                  Prevents flickery start/stop. 10s is a good default.
-        fps: Frame rate for output video.
-        codec: FourCC codec string.
-    """
-
     def __init__(
         self,
         output_dir: str = 'recordings/events',
         cooldown: float = 10.0,
         fps: float = 15.0,
-        codec: str = 'mp4v',
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cooldown = cooldown
         self.fps = fps
-        self.codec = codec
+        self._use_ffmpeg = bool(shutil.which('ffmpeg'))
 
         self.state = RecorderState.IDLE
-        self._writer: cv2.VideoWriter | None = None
+        self._process: subprocess.Popen | None = None
         self._current_path: Path | None = None
         self._meta: EventMetadata | None = None
         self._last_trigger: float = 0
@@ -90,15 +67,13 @@ class EventRecorder:
     def is_recording(self) -> bool:
         return self.state in (RecorderState.RECORDING, RecorderState.COOLDOWN)
 
-    def update(self, frame: np.ndarray, triggered: bool, detections: list[dict] | None = None):
-        """
-        Call this every frame.
+    @property
+    def event_id(self) -> str | None:
+        if self._current_path is not None:
+            return self._current_path.stem.replace('event_', '')
+        return None
 
-        Args:
-            frame: The video frame.
-            triggered: Whether motion/detection is active this frame.
-            detections: Optional detection results for metadata logging.
-        """
+    def update(self, frame: np.ndarray, triggered: bool, detections: list[dict] | None = None):
         now = time.time()
 
         if self.state == RecorderState.IDLE:
@@ -110,23 +85,22 @@ class EventRecorder:
             if triggered:
                 self._last_trigger = now
             else:
-                # Motion stopped, enter cooldown
                 self.state = RecorderState.COOLDOWN
 
         elif self.state == RecorderState.COOLDOWN:
             if triggered:
-                # Motion resumed, back to recording
                 self._last_trigger = now
                 self.state = RecorderState.RECORDING
             elif now - self._last_trigger >= self.cooldown:
-                # Cooldown expired, stop recording
                 self._stop_recording(now)
                 self.state = RecorderState.IDLE
                 return
 
-        # Write frame if recording
-        if self.is_recording and self._writer is not None:
-            self._writer.write(frame)
+        if self.is_recording and self._process is not None:
+            try:
+                self._process.stdin.write(frame.tobytes())
+            except (BrokenPipeError, OSError):
+                pass
             if detections and self._meta:
                 self._meta.add_detections(detections)
 
@@ -140,20 +114,36 @@ class EventRecorder:
         self._current_path = self.output_dir / f"event_{timestamp}.mp4"
         meta_path = self.output_dir / f"event_{timestamp}.json"
 
-        fourcc = cv2.VideoWriter_fourcc(*self.codec)
-        self._writer = cv2.VideoWriter(
-            str(self._current_path), fourcc, self.fps, self._frame_size
-        )
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+            '-s', f'{w}x{h}', '-r', str(self.fps),
+            '-i', 'pipe:0',
+            '-c:v', 'libx264', '-preset', 'ultrafast',
+            '-crf', '23', '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            str(self._current_path),
+        ]
 
-        self._meta = EventMetadata(
-            start_time=datetime.now().isoformat(),
-        )
+        try:
+            self._process = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            self._process = None
+
+        self._meta = EventMetadata(start_time=datetime.now().isoformat())
         self._meta_path = meta_path
 
     def _stop_recording(self, now: float):
-        if self._writer is not None:
-            self._writer.release()
-            self._writer = None
+        if self._process is not None:
+            try:
+                self._process.stdin.close()
+            except OSError:
+                pass
+            self._process.wait(timeout=10)
+            self._process = None
 
         if self._meta is not None:
             self._meta.end_time = datetime.now().isoformat()
@@ -173,6 +163,5 @@ class EventRecorder:
         self._current_path = None
 
     def release(self):
-        """Clean up on shutdown."""
         if self.is_recording:
             self._stop_recording(time.time())

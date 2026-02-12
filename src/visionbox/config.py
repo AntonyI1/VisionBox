@@ -60,7 +60,10 @@ class AnnotatedRecordingConfig:
 @dataclass
 class RetentionConfig:
     days: int = 14
+    max_storage_gb: float = 0  # 0 = unlimited
     check_interval: int = 3600  # seconds
+    max_per_label: int = 0  # 0 = unlimited
+    priority_labels: list = field(default_factory=lambda: ['person'])
 
 
 @dataclass
