@@ -101,6 +101,40 @@ class RecordingDatabase:
             ).fetchone()
         return row[0] if row else 0
 
+    def get_overflow_events(self, label: str, max_keep: int) -> list[dict]:
+        with self._lock:
+            self._conn.row_factory = sqlite3.Row
+            rows = self._conn.execute(
+                'SELECT * FROM events WHERE end_time IS NOT NULL AND top_label=? '
+                'ORDER BY start_time DESC LIMIT -1 OFFSET ?',
+                (label, max_keep)
+            ).fetchall()
+            self._conn.row_factory = None
+        return [dict(row) for row in rows]
+
+    def get_label_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT top_label, COUNT(*) FROM events WHERE end_time IS NOT NULL '
+                'GROUP BY top_label'
+            ).fetchall()
+        return {row[0]: row[1] for row in rows if row[0]}
+
+    def get_events_by_delete_priority(self, priority_labels: list[str]) -> list[dict]:
+        """Return events ordered for deletion: non-priority oldest first, then priority oldest."""
+        placeholders = ','.join('?' * len(priority_labels)) if priority_labels else "''"
+        query = (
+            'SELECT * FROM events WHERE end_time IS NOT NULL '
+            'ORDER BY '
+            f'CASE WHEN top_label IN ({placeholders}) THEN 1 ELSE 0 END ASC, '
+            'start_time ASC'
+        )
+        with self._lock:
+            self._conn.row_factory = sqlite3.Row
+            rows = self._conn.execute(query, priority_labels).fetchall()
+            self._conn.row_factory = None
+        return [dict(row) for row in rows]
+
     def update_event_thumbnail(self, event_id: str, thumbnail: str):
         with self._lock:
             self._conn.execute(
