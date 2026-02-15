@@ -83,6 +83,16 @@ class CaptureConfig:
 
 
 @dataclass
+class StorageConfig:
+    recordings: str = 'recordings'
+    crops: str = 'captures/crops'
+    dataset: str = 'captures/dataset'
+    review: str = 'datasets/review'
+    training: str = 'datasets/training'
+    zones: str = 'zones.json'
+
+
+@dataclass
 class DisplayConfig:
     web: bool = True
     web_port: int = 8085
@@ -92,6 +102,7 @@ class DisplayConfig:
 @dataclass
 class VisionBoxConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)

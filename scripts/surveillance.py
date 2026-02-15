@@ -47,12 +47,9 @@ def open_browser(url: str):
 np.random.seed(42)
 COLORS = [(int(c[0]), int(c[1]), int(c[2])) for c in np.random.randint(0, 255, (100, 3))]
 
-REVIEW_DIR = Path('/mnt/storage/visionbox/datasets/review')
-CAPTURES_DIR = Path('/mnt/storage/visionbox/captures/crops')
-DATASET_DIR = Path('/mnt/storage/visionbox/captures/dataset')
-
-for d in [REVIEW_DIR, CAPTURES_DIR, DATASET_DIR / 'images', DATASET_DIR / 'labels']:
-    d.mkdir(parents=True, exist_ok=True)
+REVIEW_DIR = None
+CAPTURES_DIR = None
+DATASET_DIR = None
 
 
 class CameraStream:
@@ -170,6 +167,46 @@ def draw_tracks(image, tracks, track_info, class_names):
     return image
 
 
+def init_storage(cfg):
+    global REVIEW_DIR, CAPTURES_DIR, DATASET_DIR
+    REVIEW_DIR = Path(cfg.storage.review)
+    CAPTURES_DIR = Path(cfg.storage.crops)
+    DATASET_DIR = Path(cfg.storage.dataset)
+    for d in [REVIEW_DIR, CAPTURES_DIR, DATASET_DIR / 'images', DATASET_DIR / 'labels']:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def run_ui_only(cfg):
+    output_dir = Path(cfg.recording.output_dir)
+    db_path = output_dir / 'visionbox.db'
+    db = RecordingDatabase(db_path)
+    zone_filter = ZoneFilter(cfg.storage.zones)
+
+    api_state = PipelineState(
+        zone_filter=zone_filter,
+        config=cfg,
+        offline=True,
+        db=db,
+        output_dir=output_dir,
+        crops_dir=Path(cfg.storage.crops),
+        training_dir=Path(cfg.storage.training),
+    )
+
+    port = cfg.display.web_port
+    start_api_server(api_state, port)
+    print(f"VisionBox UI-only mode")
+    print(f"  Web UI: http://localhost:{port}")
+    print(f"  Database: {db_path}")
+    print(f"  Press Ctrl+C to stop")
+    open_browser(f'http://localhost:{port}')
+
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda s, f: stop.set())
+    signal.signal(signal.SIGTERM, lambda s, f: stop.set())
+    stop.wait()
+    db.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description='VisionBox Surveillance')
     parser.add_argument('url', nargs='?', help='Camera URL (overrides config)')
@@ -179,34 +216,10 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    init_storage(cfg)
 
     if args.ui_only:
-        output_dir = Path(cfg.recording.output_dir)
-        db_path = output_dir / 'visionbox.db'
-        db = RecordingDatabase(db_path)
-        zone_filter = ZoneFilter('zones.json')
-
-        api_state = PipelineState(
-            zone_filter=zone_filter,
-            config=cfg,
-            offline=True,
-            db=db,
-            output_dir=output_dir,
-        )
-
-        port = cfg.display.web_port
-        start_api_server(api_state, port)
-        print(f"VisionBox UI-only mode")
-        print(f"  Web UI: http://localhost:{port}")
-        print(f"  Database: {db_path}")
-        print(f"  Press Ctrl+C to stop")
-        open_browser(f'http://localhost:{port}')
-
-        stop = threading.Event()
-        signal.signal(signal.SIGINT, lambda s, f: stop.set())
-        signal.signal(signal.SIGTERM, lambda s, f: stop.set())
-        stop.wait()
-        db.close()
+        run_ui_only(cfg)
         return
 
     stream_url = args.url or cfg.camera.url or os.environ.get('CAMERA_URL', '')
@@ -216,6 +229,24 @@ def main():
         print("Usage: python scripts/surveillance.py <camera_url>")
         print("  Or set CAMERA_URL in .env or config.yml")
         sys.exit(1)
+
+    # Check camera before loading models
+    print(f"Connecting to camera...")
+    cap = CameraStream(stream_url)
+    if not cap.isOpened():
+        print("Camera unavailable, falling back to UI-only mode...")
+        cap.release()
+        run_ui_only(cfg)
+        return
+    time.sleep(1)
+
+    ret, test_frame = cap.read()
+    if not ret or test_frame is None:
+        print("Camera not responding, falling back to UI-only mode...")
+        cap.release()
+        run_ui_only(cfg)
+        return
+    print("Camera connected")
 
     no_display = not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
     class_filter = CLASS_PRESETS_V2[cfg.detection.mode]
@@ -232,7 +263,7 @@ def main():
     motion = MotionDetector(min_area=cfg.motion.min_area)
     recording_mgr = RecordingManager(cfg.recording, rtsp_url=stream_url)
     recording_mgr.start()
-    zone_filter = ZoneFilter('zones.json')
+    zone_filter = ZoneFilter(cfg.storage.zones)
     print(f"Model loaded ({detector.device})")
 
     clean_status = "enabled" if recording_mgr.clean and recording_mgr.clean.available else "disabled"
@@ -244,6 +275,8 @@ def main():
         recording_mgr=recording_mgr,
         zone_filter=zone_filter,
         config=cfg,
+        crops_dir=CAPTURES_DIR,
+        training_dir=Path(cfg.storage.training),
     )
 
     if cfg.display.web:
@@ -255,14 +288,8 @@ def main():
     print(f"  Mode: {cfg.detection.mode} | Confidence: {cfg.detection.confidence}")
     print(f"  Detection FPS: {cfg.detection.detect_fps} | Loop FPS: {cfg.display.max_fps}")
     print(f"  Recording cooldown: {cfg.recording.annotated.cooldown}s")
-    print(f"  Outputs: {cfg.recording.output_dir}/ | captures/ | datasets/review/")
+    print(f"  Outputs: {cfg.recording.output_dir}/")
     print(f"\n{'Controls: q quit | r reset' if not no_display else 'Press Ctrl+C to stop'}")
-
-    cap = CameraStream(stream_url)
-    if not cap.isOpened():
-        print("ERROR: Could not open camera")
-        return
-    time.sleep(1)
 
     track_info = {}
     track_last_capture = {}
@@ -491,7 +518,7 @@ def main():
             for name, count in sorted(class_counts.items(), key=lambda x: -x[1]):
                 print(f"    {name}: {count}")
         print(f"  Uncertain: {uncertain_count}")
-        print(f"  Outputs: {cfg.recording.output_dir}/ | captures/ | datasets/review/")
+        print(f"  Outputs: {cfg.recording.output_dir}/")
 
 
 def _box_iou(a, b):

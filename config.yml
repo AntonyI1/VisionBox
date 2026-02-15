@@ -2,6 +2,14 @@ camera:
   url: ${CAMERA_URL}
   # test_input: test_input.mp4  # Uncomment to use a test video
 
+storage:
+  recordings: ${STORAGE_DIR}/recordings
+  crops: ${STORAGE_DIR}/captures/crops
+  dataset: ${STORAGE_DIR}/captures/dataset
+  review: ${STORAGE_DIR}/datasets/review
+  training: ${STORAGE_DIR}/datasets/training
+  zones: zones.json
+
 detection:
   mode: outdoor
   confidence: 0.20
@@ -27,7 +35,7 @@ tracker:
   max_coast: 15
 
 recording:
-  output_dir: /mnt/storage/visionbox/recordings
+  output_dir: ${STORAGE_DIR}/recordings
   clean:
     enabled: true
   annotated:
