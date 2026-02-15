@@ -32,8 +32,8 @@ class PipelineState:
     frame_count: int = 0
     event_count: int = 0
     start_time: float = field(default_factory=time.time)
-    crops_dir: Path = field(default_factory=lambda: Path('/mnt/storage/visionbox/captures/crops'))
-    training_dir: Path = field(default_factory=lambda: Path('/mnt/storage/visionbox/datasets/training'))
+    crops_dir: Path = field(default_factory=lambda: Path('captures/crops'))
+    training_dir: Path = field(default_factory=lambda: Path('datasets/training'))
     offline: bool = False
     db: RecordingDatabase | None = None
     output_dir: Path | None = None
