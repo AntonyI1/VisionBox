@@ -59,7 +59,6 @@ def main():
     parser.add_argument('--mode', choices=['outdoor', 'indoor', 'vehicles', 'all'], default='all',
                         help='Detection mode: outdoor, indoor, vehicles, all')
     parser.add_argument('--conf', type=float, default=0.25, help='Confidence threshold')
-    parser.add_argument('--legacy', action='store_true', help='Use legacy YOLOv5 detector')
     args = parser.parse_args()
 
     stream_url = args.url or os.environ.get('CAMERA_URL')
@@ -73,15 +72,8 @@ def main():
 
     print(f"Loading models... (mode: {mode_name})")
 
-    if args.legacy:
-        # Legacy YOLOv5 detector
-        from visionbox import Detector
-        detector = Detector('yolov5s', device='cuda')
-        class_names = {i: name for i, name in enumerate(detector.model.names)}
-    else:
-        # New multi-model detector (YOLOv8 + license plates)
-        detector = create_surveillance_detector(device='cuda')
-        class_names = detector.class_names
+    detector = create_surveillance_detector(device='cuda')
+    class_names = detector.class_names
 
     tracker = Tracker(max_age=30, min_hits=3, iou_threshold=0.3)
     print("Models loaded")
@@ -112,20 +104,11 @@ def main():
         start = time.time()
 
         # Detection
-        if args.legacy:
-            detections = detector.detect(frame, conf_threshold=args.conf, iou_threshold=0.45)
-            if class_filter:
-                detections = [d for d in detections if d['class_id'] in class_filter]
-            det_array = np.array([
-                [*d['box'], d['confidence'], d['class_id']]
-                for d in detections
-            ]) if detections else np.empty((0, 6))
-        else:
-            det_array = detector.detect_array(frame, conf_threshold=args.conf, classes=class_filter)
-            detections = [
-                {'box': det[:4], 'confidence': det[4], 'class_id': int(det[5])}
-                for det in det_array
-            ]
+        det_array = detector.detect_array(frame, conf_threshold=args.conf, classes=class_filter)
+        detections = [
+            {'box': det[:4], 'confidence': det[4], 'class_id': int(det[5])}
+            for det in det_array
+        ]
 
         # Tracking
         tracks = tracker.update(det_array)
