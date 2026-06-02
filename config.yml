@@ -1,38 +1,63 @@
-camera:
-  url: ${CAMERA_URL}
-  # test_input: test_input.mp4  # Uncomment to use a test video
+# VisionBox multi-camera surveillance.
+# All ${VAR} placeholders are read from .env (or the environment).
+
+cameras:
+  # Feeds come from Frigate's go2rtc restream (rtsp://127.0.0.1:8554/<name>): each
+  # camera is pulled once by go2rtc and fanned out, so enabling all four adds no
+  # extra camera-side bandwidth. No camera credentials are needed here.
+  front_door:
+    url:        rtsp://127.0.0.1:8554/front_door       # main 2688x1520 -> recording
+    detect_url: rtsp://127.0.0.1:8554/front_door_sub   # sub 704x576 -> detection
+
+  front_garage:
+    url: rtsp://127.0.0.1:8554/front_garage            # 1280x720 (single stream)
+
+  backyard:
+    url: rtsp://127.0.0.1:8554/backyard                # 1920x1080 (no substream)
+
+  backyard_gate:
+    url: rtsp://127.0.0.1:8554/backyard_gate           # 1920x1080 (no substream)
 
 storage:
   recordings: ${STORAGE_DIR}/recordings
-  crops: ${STORAGE_DIR}/captures/crops
-  dataset: ${STORAGE_DIR}/captures/dataset
-  review: ${STORAGE_DIR}/datasets/review
-  training: ${STORAGE_DIR}/datasets/training
-  zones: zones.json
+  crops:      ${STORAGE_DIR}/captures/crops
+  dataset:    ${STORAGE_DIR}/captures/dataset
+  review:     ${STORAGE_DIR}/datasets/review
+  training:   ${STORAGE_DIR}/datasets/training
+  zones_dir:  ${STORAGE_DIR}/zones
 
 detection:
   mode: outdoor
-  confidence: 0.20
-  detect_fps: 8
+  confidence: 0.25
+  detect_fps: 5          # per-camera detect rate; one shared GPU detector across all cameras
   model: yolov8n.pt
-  imgsz: 640
+  imgsz: 640             # must match the exported OpenVINO model (640x640); raise only after re-exporting
+  device: gpu            # iGPU via OpenVINO (intel:gpu); falls back to CPU automatically
   class_conf:
-    0: 0.50    # person
-    2: 0.35    # car
-    5: 0.35    # bus
-    7: 0.35    # truck
-    14: 0.50   # bird
-    15: 0.40   # cat
-    16: 0.40   # dog
+    0: 0.45    # person
+    2: 0.40    # car
+    5: 0.45    # bus
+    7: 0.45    # truck
+    14: 0.55   # bird
+    15: 0.45   # cat
+    16: 0.45   # dog
+
+  # A track counts as a real object only once the MEDIAN of its detection scores
+  # crosses this (Frigate-style) — a one-frame false positive never triggers events.
+  confirm_threshold: 0.45   # median track score to confirm; kept <= class_conf so mid-conf objects aren't dropped
+  confirm_window: 10
+  confirm_min_count: 2      # a track needs at least this many detections before it can confirm (kills 1-frame flicker)
 
 motion:
-  min_area: 500
+  min_area: 2000          # ignore tiny shadow/leaf flickers near parked cars
 
 tracker:
   max_age: 75
   min_hits: 2
   iou_threshold: 0.2
   max_coast: 15
+  stationary_min_displacement: 30    # px — track must move this much to count as moving
+  stationary_window: 2.5             # seconds of history to evaluate movement over
 
 recording:
   output_dir: ${STORAGE_DIR}/recordings
@@ -44,9 +69,9 @@ recording:
     cooldown: 10.0
   retention:
     days: 30
-    max_storage_gb: 1000
+    max_storage_gb: 0
     check_interval: 3600
-    max_per_label: 0  # 0 = unlimited
+    max_per_label: 0
     priority_labels: [person]
 
 capture:
@@ -58,4 +83,4 @@ capture:
 display:
   web: true
   web_port: 8085
-  max_fps: 30
+  max_fps: 15            # main-loop rate (motion + live view); detection is separately gated at detect_fps
