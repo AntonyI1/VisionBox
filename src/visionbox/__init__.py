@@ -17,7 +17,7 @@ from .clean_recorder import CleanRecorder
 from .recording_manager import RecordingManager
 from .database import RecordingDatabase
 from .zones import ZoneFilter, Zone
-from .api import PipelineState, start_api_server
+from .api import CamerasState, CameraView, PipelineState, start_api_server
 
 __all__ = [
     'KalmanBoxTracker', 'Tracker',
@@ -29,5 +29,5 @@ __all__ = [
     'VisionBoxConfig', 'StorageConfig', 'load_config',
     'CleanRecorder', 'RecordingManager', 'RecordingDatabase',
     'ZoneFilter', 'Zone',
-    'PipelineState', 'start_api_server',
+    'CamerasState', 'CameraView', 'PipelineState', 'start_api_server',
 ]
