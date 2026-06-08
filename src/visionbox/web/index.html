@@ -17,9 +17,8 @@
             <button class="nav-btn" data-view="training">Training</button>
         </nav>
         <div id="status-bar">
-            <span id="status-dot" class="dot idle"></span>
-            <span id="status-text">IDLE</span>
-            <span id="status-fps">-- FPS</span>
+            <span id="status-cams">-- cameras</span>
+            <span id="status-recording">--</span>
             <span id="status-events">0 events</span>
             <span id="status-storage"></span>
             <span id="status-uptime"></span>
@@ -28,13 +27,18 @@
 
     <main>
         <section id="view-live" class="view active">
-            <div class="stream-container">
-                <img id="live-stream" src="/api/stream" alt="Live stream">
-                <div id="offline-msg" class="offline-msg" style="display:none">Camera Offline</div>
+            <div id="live-grid" class="live-grid"></div>
+            <div id="live-empty" class="empty-state" style="display:none">
+                No cameras configured. Add some to <code>config.yml</code>.
             </div>
         </section>
 
         <section id="view-events" class="view">
+            <div class="filter-bar">
+                <select id="events-cam-filter">
+                    <option value="">All cameras</option>
+                </select>
+            </div>
             <div id="events-grid" class="events-grid"></div>
             <div id="events-empty" class="empty-state" style="display:none">
                 No events recorded yet.
@@ -43,9 +47,17 @@
         </section>
 
         <section id="view-zones" class="view">
+            <div class="filter-bar">
+                <select id="zones-cam-select">
+                    <option value="">Select camera...</option>
+                </select>
+            </div>
             <div class="zones-layout">
                 <div class="zone-canvas-wrap">
                     <canvas id="zone-canvas"></canvas>
+                    <div id="zone-empty" class="empty-state" style="padding:100px 20px">
+                        Select a camera above.
+                    </div>
                     <div id="zone-hint" class="zone-hint">Click to place points. Click near the first point to close the polygon.</div>
                 </div>
                 <div class="zone-sidebar">
@@ -70,6 +82,7 @@
         <section id="view-review" class="view">
             <div class="review-layout">
                 <div class="review-header">
+                    <select id="review-cam-select"><option value="">Select camera...</option></select>
                     <select id="review-class-select">
                         <option value="">Select class...</option>
                     </select>
@@ -78,7 +91,7 @@
                 <div class="review-card">
                     <div class="review-image-wrap">
                         <img id="review-image" alt="">
-                        <div id="review-empty" class="empty-state">Select a class to start reviewing crops.</div>
+                        <div id="review-empty" class="empty-state">Pick a camera and class to start reviewing.</div>
                     </div>
                     <div id="review-meta" class="review-meta"></div>
                 </div>
@@ -136,6 +149,15 @@
                 <button id="modal-delete" class="delete-btn">Delete Event</button>
             </div>
         </div>
+    </div>
+
+    <div id="live-focus" class="live-focus" style="display:none">
+        <div class="live-focus-bar">
+            <span id="focus-name"></span>
+            <span id="focus-stats" class="focus-stats"></span>
+            <button id="focus-close" class="modal-close-btn">&times;</button>
+        </div>
+        <img id="focus-stream" alt="">
     </div>
 
     <script src="/static/app.js"></script>
