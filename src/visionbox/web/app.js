@@ -423,7 +423,7 @@
         zoneCtx.drawImage(snapshotImg, 0, 0, w, h);
         zones.forEach(z => {
             const pts = z.points.map(p => [p[0] * w, p[1] * h]);
-            const color = z.type === 'include' ? 'rgba(67,160,71,' : 'rgba(229,57,53,';
+            const color = z.type === 'include' ? 'rgba(123,165,94,' : 'rgba(221,92,70,';
             zoneCtx.beginPath();
             pts.forEach((p, i) => i === 0 ? zoneCtx.moveTo(p[0], p[1]) : zoneCtx.lineTo(p[0], p[1]));
             zoneCtx.closePath();
@@ -441,7 +441,7 @@
         });
         if (drawingPoints.length > 0) {
             const pts = drawingPoints.map(p => [p[0] * w, p[1] * h]);
-            const color = zoneType === 'include' ? 'rgba(67,160,71,' : 'rgba(229,57,53,';
+            const color = zoneType === 'include' ? 'rgba(123,165,94,' : 'rgba(221,92,70,';
             zoneCtx.beginPath();
             pts.forEach((p, i) => i === 0 ? zoneCtx.moveTo(p[0], p[1]) : zoneCtx.lineTo(p[0], p[1]));
             zoneCtx.strokeStyle = color + '0.9)';
