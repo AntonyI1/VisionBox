@@ -73,6 +73,7 @@
 
     function onViewChange(view) {
         closeFocus();
+        if (view !== 'live') stopGridStreams();
         if (view === 'live') {
             renderLiveGrid();
         } else if (view === 'events') {
@@ -129,18 +130,65 @@
             .catch(() => {});
     }
 
-    setInterval(pollStatus, STATUS_INTERVAL);
-    setInterval(pollCameras, CAMERAS_INTERVAL);
+    let statusTimer = null, camerasTimer = null;
+
+    function startPolling() {
+        if (statusTimer === null) statusTimer = setInterval(pollStatus, STATUS_INTERVAL);
+        if (camerasTimer === null) camerasTimer = setInterval(pollCameras, CAMERAS_INTERVAL);
+    }
+
+    function stopPolling() {
+        clearInterval(statusTimer); statusTimer = null;
+        clearInterval(camerasTimer); camerasTimer = null;
+    }
+
+    function onVisibility() {
+        if (document.hidden) {
+            stopPolling();
+            stopGridStreams();
+            if (focusedCam) focusImg.src = '';
+        } else {
+            startPolling();
+            pollStatus();
+            pollCameras();
+            if (focusedCam) {
+                focusImg.src = '/api/cameras/' + encodeURIComponent(focusedCam) + '/stream';
+            } else if (gridShouldStream()) {
+                startGridStreams();
+            }
+        }
+    }
+    document.addEventListener('visibilitychange', onVisibility);
+
     pollStatus();
     pollCameras();
+    if (!document.hidden) startPolling();
 
     // ---------- Live grid ----------
 
     const liveGrid = document.getElementById('live-grid');
     const liveEmpty = document.getElementById('live-empty');
+    const tileRefs = new Map();
+
+    // Each open /stream holds a server encode thread; only stream a tile when its frame can be seen.
+    function gridShouldStream() {
+        return currentView === 'live' && !focusedCam && !document.hidden;
+    }
+
+    function startGridStreams() {
+        tileRefs.forEach((r, name) => {
+            const url = '/api/cameras/' + encodeURIComponent(name) + '/stream';
+            if (r.img.getAttribute('src') !== url) r.img.src = url;
+        });
+    }
+
+    function stopGridStreams() {
+        tileRefs.forEach(r => { r.img.src = ''; });
+    }
 
     function renderLiveGrid() {
         liveGrid.innerHTML = '';
+        tileRefs.clear();
         if (cameras.length === 0) {
             liveEmpty.style.display = 'block';
             return;
@@ -149,13 +197,14 @@
         // Layout class for grid columns: 1, 2, 4, etc.
         const cols = cameras.length <= 1 ? 1 : cameras.length <= 4 ? 2 : 3;
         liveGrid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+        const frag = document.createDocumentFragment();
         cameras.forEach(cam => {
             const tile = document.createElement('div');
             tile.className = 'live-tile';
             tile.dataset.cam = cam.name;
             tile.innerHTML =
                 '<div class="tile-stream-wrap">' +
-                '<img class="tile-stream" src="/api/cameras/' + encodeURIComponent(cam.name) + '/stream" alt="">' +
+                '<img class="tile-stream" alt="">' +
                 '<div class="tile-offline-msg">Offline</div>' +
                 '</div>' +
                 '<div class="tile-bar">' +
@@ -164,22 +213,28 @@
                 '<span class="tile-fps"></span>' +
                 '</div>';
             tile.addEventListener('click', () => openFocus(cam.name));
-            liveGrid.appendChild(tile);
+            tileRefs.set(cam.name, {
+                img: tile.querySelector('.tile-stream'),
+                dot: tile.querySelector('.tile-dot'),
+                fps: tile.querySelector('.tile-fps'),
+                wrap: tile.querySelector('.tile-stream-wrap'),
+            });
+            frag.appendChild(tile);
         });
+        liveGrid.appendChild(frag);
+        if (gridShouldStream()) startGridStreams();
         updateLiveStats();
     }
 
     function updateLiveStats() {
         cameras.forEach(cam => {
-            const tile = liveGrid.querySelector(`.live-tile[data-cam="${CSS.escape(cam.name)}"]`);
-            if (!tile) return;
-            const dot = tile.querySelector('.tile-dot');
-            dot.className = 'tile-dot ' + (cam.recording ? 'recording'
+            const r = tileRefs.get(cam.name);
+            if (!r) return;
+            r.dot.className = 'tile-dot ' + (cam.recording ? 'recording'
                 : cam.connected ? 'connected' : 'offline');
-            tile.querySelector('.tile-fps').textContent =
+            r.fps.textContent =
                 cam.connected ? cam.fps.toFixed(1) + ' FPS' : (cam.last_error || 'offline');
-            const wrap = tile.querySelector('.tile-stream-wrap');
-            wrap.classList.toggle('disconnected', !cam.connected);
+            r.wrap.classList.toggle('disconnected', !cam.connected);
         });
     }
 
@@ -191,6 +246,7 @@
     let focusedCam = null;
 
     function openFocus(name) {
+        stopGridStreams();
         focusedCam = name;
         focusImg.src = '/api/cameras/' + encodeURIComponent(name) + '/stream';
         focusName.textContent = name;
@@ -212,6 +268,7 @@
         focusedCam = null;
         focusImg.src = '';
         focusEl.style.display = 'none';
+        if (gridShouldStream()) startGridStreams();
     }
     document.getElementById('focus-close').addEventListener('click', closeFocus);
     document.addEventListener('keydown', e => {
@@ -251,7 +308,9 @@
                     return;
                 }
                 eventsEmpty.style.display = 'none';
-                data.events.forEach(ev => eventsGrid.appendChild(createCard(ev)));
+                const frag = document.createDocumentFragment();
+                data.events.forEach(ev => frag.appendChild(createCard(ev)));
+                eventsGrid.appendChild(frag);
                 eventsOffset += data.events.length;
                 loadMoreBtn.style.display = eventsOffset < eventsTotal ? 'block' : 'none';
             })
@@ -381,6 +440,8 @@
     let snapshotImg = null;
     let zoneType = 'include';
     let zonesCurrentCam = '';
+    let zoneFramePending = false;
+    let zoneCursor = null;
 
     zonesCamSelect.addEventListener('change', () => {
         zonesCurrentCam = zonesCamSelect.value;
@@ -487,18 +548,25 @@
 
     zoneCanvas.addEventListener('mousemove', e => {
         if (!isDrawing || drawingPoints.length === 0) return;
-        drawZoneCanvas();
-        const [nx, ny] = canvasCoords(e);
-        const w = zoneCanvas.width, h = zoneCanvas.height;
-        const last = drawingPoints[drawingPoints.length - 1];
-        zoneCtx.beginPath();
-        zoneCtx.moveTo(last[0] * w, last[1] * h);
-        zoneCtx.lineTo(nx * w, ny * h);
-        zoneCtx.strokeStyle = 'rgba(255,255,255,0.5)';
-        zoneCtx.lineWidth = 1;
-        zoneCtx.setLineDash([4, 4]);
-        zoneCtx.stroke();
-        zoneCtx.setLineDash([]);
+        zoneCursor = canvasCoords(e);
+        if (zoneFramePending) return;
+        zoneFramePending = true;
+        requestAnimationFrame(() => {
+            zoneFramePending = false;
+            if (!isDrawing || drawingPoints.length === 0 || !zoneCursor) return;
+            drawZoneCanvas();
+            const [nx, ny] = zoneCursor;
+            const w = zoneCanvas.width, h = zoneCanvas.height;
+            const last = drawingPoints[drawingPoints.length - 1];
+            zoneCtx.beginPath();
+            zoneCtx.moveTo(last[0] * w, last[1] * h);
+            zoneCtx.lineTo(nx * w, ny * h);
+            zoneCtx.strokeStyle = 'rgba(255,255,255,0.5)';
+            zoneCtx.lineWidth = 1;
+            zoneCtx.setLineDash([4, 4]);
+            zoneCtx.stroke();
+            zoneCtx.setLineDash([]);
+        });
     });
 
     document.getElementById('zone-add-btn').addEventListener('click', () => {
