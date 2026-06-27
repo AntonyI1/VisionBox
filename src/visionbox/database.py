@@ -25,19 +25,27 @@ class RecordingDatabase:
                 clean_clip TEXT,
                 annotated_clip TEXT,
                 thumbnail TEXT,
+                snapshot TEXT,
                 detection_count INTEGER DEFAULT 0,
                 top_label TEXT DEFAULT ''
             )
         ''')
         self._conn.commit()
         self._migrate()
+        self._conn.execute('CREATE INDEX IF NOT EXISTS idx_events_camera ON events(camera)')
+        self._conn.execute('CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_time DESC)')
+        self._conn.commit()
 
     def _migrate(self):
         cursor = self._conn.execute('PRAGMA table_info(events)')
         columns = {row[1] for row in cursor.fetchall()}
         if 'thumbnail' not in columns:
             self._conn.execute('ALTER TABLE events ADD COLUMN thumbnail TEXT')
-            self._conn.commit()
+        if 'camera' not in columns:
+            self._conn.execute("ALTER TABLE events ADD COLUMN camera TEXT DEFAULT ''")
+        if 'snapshot' not in columns:
+            self._conn.execute('ALTER TABLE events ADD COLUMN snapshot TEXT')
+        self._conn.commit()
 
     def insert_event(self, event_id: str, start_time: datetime,
                      camera: str = '', clean_clip: str = '', annotated_clip: str = ''):
@@ -74,14 +82,19 @@ class RecordingDatabase:
             self._conn.execute('DELETE FROM events WHERE event_id=?', (event_id,))
             self._conn.commit()
 
-    def get_events(self, limit: int = 50, offset: int = 0) -> list[dict]:
+    def get_events(
+        self, limit: int = 50, offset: int = 0, camera: str | None = None,
+    ) -> list[dict]:
+        query = 'SELECT * FROM events WHERE end_time IS NOT NULL'
+        params: list = []
+        if camera:
+            query += ' AND camera=?'
+            params.append(camera)
+        query += ' ORDER BY start_time DESC LIMIT ? OFFSET ?'
+        params.extend([limit, offset])
         with self._lock:
             self._conn.row_factory = sqlite3.Row
-            rows = self._conn.execute(
-                'SELECT * FROM events WHERE end_time IS NOT NULL '
-                'ORDER BY start_time DESC LIMIT ? OFFSET ?',
-                (limit, offset)
-            ).fetchall()
+            rows = self._conn.execute(query, params).fetchall()
             self._conn.row_factory = None
         return [dict(row) for row in rows]
 
@@ -94,30 +107,51 @@ class RecordingDatabase:
             self._conn.row_factory = None
         return dict(row) if row else None
 
-    def get_event_count(self) -> int:
+    def get_event_count(self, camera: str | None = None) -> int:
+        query = 'SELECT COUNT(*) FROM events WHERE end_time IS NOT NULL'
+        params: list = []
+        if camera:
+            query += ' AND camera=?'
+            params.append(camera)
         with self._lock:
-            row = self._conn.execute(
-                'SELECT COUNT(*) FROM events WHERE end_time IS NOT NULL'
-            ).fetchone()
+            row = self._conn.execute(query, params).fetchone()
         return row[0] if row else 0
 
-    def get_overflow_events(self, label: str, max_keep: int) -> list[dict]:
+    def get_camera_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT camera, COUNT(*) FROM events WHERE end_time IS NOT NULL '
+                'GROUP BY camera'
+            ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def get_overflow_events(
+        self, label: str, max_keep: int, camera: str | None = None,
+    ) -> list[dict]:
+        query = 'SELECT * FROM events WHERE end_time IS NOT NULL AND top_label=?'
+        params: list = [label]
+        if camera:
+            query += ' AND camera=?'
+            params.append(camera)
+        query += ' ORDER BY start_time DESC LIMIT -1 OFFSET ?'
+        params.append(max_keep)
         with self._lock:
             self._conn.row_factory = sqlite3.Row
-            rows = self._conn.execute(
-                'SELECT * FROM events WHERE end_time IS NOT NULL AND top_label=? '
-                'ORDER BY start_time DESC LIMIT -1 OFFSET ?',
-                (label, max_keep)
-            ).fetchall()
+            rows = self._conn.execute(query, params).fetchall()
             self._conn.row_factory = None
         return [dict(row) for row in rows]
 
-    def get_label_counts(self) -> dict[str, int]:
+    def get_label_counts(self, camera: str | None = None) -> dict[str, int]:
+        query = (
+            'SELECT top_label, COUNT(*) FROM events WHERE end_time IS NOT NULL'
+        )
+        params: list = []
+        if camera:
+            query += ' AND camera=?'
+            params.append(camera)
+        query += ' GROUP BY top_label'
         with self._lock:
-            rows = self._conn.execute(
-                'SELECT top_label, COUNT(*) FROM events WHERE end_time IS NOT NULL '
-                'GROUP BY top_label'
-            ).fetchall()
+            rows = self._conn.execute(query, params).fetchall()
         return {row[0]: row[1] for row in rows if row[0]}
 
     def get_events_by_delete_priority(self, priority_labels: list[str]) -> list[dict]:
@@ -140,6 +174,14 @@ class RecordingDatabase:
             self._conn.execute(
                 'UPDATE events SET thumbnail=? WHERE event_id=?',
                 (thumbnail, event_id)
+            )
+            self._conn.commit()
+
+    def update_event_snapshot(self, event_id: str, snapshot: str):
+        with self._lock:
+            self._conn.execute(
+                'UPDATE events SET snapshot=? WHERE event_id=?',
+                (snapshot, event_id)
             )
             self._conn.commit()
 
