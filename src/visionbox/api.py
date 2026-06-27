@@ -9,18 +9,63 @@ import shutil
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, request, send_file, abort
+from flask import Flask, Response, jsonify, request, send_file, abort, session, redirect
 
 from .database import RecordingDatabase
 from .recording_manager import RecordingManager
 from .zones import ZoneFilter, Zone
 
 logger = logging.getLogger(__name__)
+
+
+_LOGIN_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VisionBox · Sign in</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font-family: system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         background:radial-gradient(1200px 600px at 50% -10%,#1b1e26,#0e0f13); color:#e6e7ea; }
+  .card { width:min(92vw,360px); background:#181a20; border:1px solid #262a33; border-radius:14px;
+          padding:30px 28px; box-shadow:0 14px 50px rgba(0,0,0,.5); }
+  .brand { display:flex; align-items:center; gap:11px; margin-bottom:24px; }
+  .dot { width:11px; height:11px; border-radius:50%; background:#3ddc84; box-shadow:0 0 12px #3ddc84; }
+  .brand h1 { font-size:19px; margin:0; font-weight:600; }
+  .brand small { color:#8b909a; font-size:12px; }
+  label { display:block; font-size:12px; color:#9aa0ab; margin:15px 0 6px; }
+  input { width:100%; padding:11px 12px; background:#0e0f13; border:1px solid #2b303a; border-radius:9px;
+          color:#e6e7ea; font-size:14px; outline:none; transition:border-color .15s; }
+  input:focus { border-color:#3ddc84; }
+  button { width:100%; margin-top:24px; padding:11px; background:#3ddc84; color:#06210f; border:0;
+           border-radius:9px; font-size:14px; font-weight:650; cursor:pointer; }
+  button:hover { background:#34c878; }
+  .err { margin-top:15px; min-height:16px; color:#ff6b6b; font-size:13px; text-align:center; }
+  .foot { margin-top:18px; text-align:center; color:#5d626c; font-size:11px; }
+</style>
+</head>
+<body>
+  <form class="card" method="post" action="">
+    <div class="brand"><span class="dot"></span><div><h1>VisionBox</h1><small>Surveillance dashboard</small></div></div>
+    <label for="u">Username</label>
+    <input id="u" name="username" value="__USER__" autocomplete="username">
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password" placeholder="Enter password" autofocus autocomplete="current-password">
+    <button type="submit">Sign in</button>
+    <div class="err">__ERROR__</div>
+    <div class="foot">Tailscale-only · household access</div>
+  </form>
+</body>
+</html>"""
 
 
 @dataclass
@@ -69,33 +114,64 @@ def create_app(state: CamerasState) -> Flask:
         static_url_path='/static',
     )
 
-    # Optional HTTP Basic auth, gated on VISIONBOX_AUTH_USER/PASS (keep them in .env —
-    # chmod 600 + gitignored). Fails CLOSED: setting only one of the pair is a hard
-    # error, never silently-open. No localhost exemption — on-box callers reload the
-    # model via SIGHUP, not this endpoint — so a same-host proxy cannot bypass auth.
+    # Auth: a session-cookie login (proper login page for browsers) that also accepts
+    # HTTP Basic for API/scripts. Gated on VISIONBOX_AUTH_USER/PASS in .env (600,
+    # gitignored); fails CLOSED if only one is set. On-box model reload is via SIGHUP,
+    # not HTTP, so there is no localhost exemption to bypass.
     _auth_user = os.environ.get('VISIONBOX_AUTH_USER', '')
     _auth_pass = os.environ.get('VISIONBOX_AUTH_PASS', '')
     if bool(_auth_user) != bool(_auth_pass):
         raise SystemExit('VISIONBOX_AUTH_USER and VISIONBOX_AUTH_PASS must both be set '
                          '(or both unset to disable auth).')
+
     if _auth_user and _auth_pass:
+        app.secret_key = os.environ.get('VISIONBOX_SECRET_KEY') or os.urandom(32)
+        app.permanent_session_lifetime = timedelta(days=30)
+        app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
         _user_b = _auth_user.encode('utf-8')
         _pass_b = _auth_pass.encode('utf-8')
 
+        def _creds_ok(user, pw):
+            try:
+                return bool(hmac.compare_digest((user or '').encode('utf-8'), _user_b)
+                            & hmac.compare_digest((pw or '').encode('utf-8'), _pass_b))
+            except (TypeError, UnicodeError):
+                return False
+
         @app.before_request
         def _require_auth():
-            auth = request.authorization
-            if auth and auth.type == 'basic':
-                try:
-                    ok = (hmac.compare_digest((auth.username or '').encode('utf-8'), _user_b)
-                          & hmac.compare_digest((auth.password or '').encode('utf-8'), _pass_b))
-                except (TypeError, UnicodeError):
-                    ok = False
-                if ok:
-                    return None
-            return Response('Authentication required', 401,
-                            {'WWW-Authenticate': 'Basic realm="VisionBox"'})
-        logger.info('dashboard auth: ENABLED (HTTP Basic)')
+            if request.path == '/login' or request.endpoint == 'static':
+                return None
+            if session.get('user'):
+                return None
+            auth = request.authorization  # API/scripts may still use HTTP Basic
+            if auth and auth.type == 'basic' and _creds_ok(auth.username, auth.password):
+                return None
+            # Browsers get the login page; programmatic clients get a plain 401
+            # (no WWW-Authenticate header -> no native browser popup).
+            if request.method == 'GET' and 'text/html' in request.headers.get('Accept', ''):
+                return redirect('/login?next=' + quote(request.full_path, safe=''))
+            return Response('Authentication required', 401)
+
+        @app.route('/login', methods=['GET', 'POST'])
+        def login():
+            error = ''
+            if request.method == 'POST':
+                if _creds_ok(request.form.get('username'), request.form.get('password')):
+                    session.permanent = True
+                    session['user'] = _auth_user
+                    nxt = request.args.get('next', '/')
+                    return redirect(nxt if nxt.startswith('/') else '/')
+                error = 'Incorrect username or password.'
+            page = _LOGIN_PAGE.replace('__USER__', _auth_user).replace('__ERROR__', error)
+            return Response(page, mimetype='text/html', status=(401 if error else 200))
+
+        @app.route('/logout')
+        def logout():
+            session.clear()
+            return redirect('/login')
+
+        logger.info('dashboard auth: ENABLED (login page + Basic)')
     else:
         logger.warning('dashboard auth: DISABLED — set VISIONBOX_AUTH_USER/PASS in .env')
 
