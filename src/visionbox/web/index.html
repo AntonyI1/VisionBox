@@ -90,7 +90,7 @@
                 </div>
                 <div class="review-card">
                     <div class="review-image-wrap">
-                        <img id="review-image" alt="">
+                        <img id="review-image" decoding="async" alt="">
                         <div id="review-empty" class="empty-state">Pick a camera and class to start reviewing.</div>
                     </div>
                     <div id="review-meta" class="review-meta"></div>
@@ -114,7 +114,7 @@
                 </div>
                 <div class="review-card">
                     <div class="review-image-wrap">
-                        <img id="training-image" alt="">
+                        <img id="training-image" decoding="async" alt="">
                         <div id="training-empty" class="empty-state">Select a class to browse approved crops.</div>
                     </div>
                     <div id="training-meta" class="review-meta"></div>
@@ -157,9 +157,9 @@
             <span id="focus-stats" class="focus-stats"></span>
             <button id="focus-close" class="modal-close-btn">&times;</button>
         </div>
-        <img id="focus-stream" alt="">
+        <img id="focus-stream" decoding="async" alt="">
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js" defer></script>
 </body>
 </html>

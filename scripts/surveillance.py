@@ -473,8 +473,11 @@ class CameraPipeline:
                 )
             else:
                 web_frame = display
-            with self.view.frame_lock:
+            with self.view.frame_cond:
                 self.view.frame = web_frame
+                self.view.frame_version += 1
+                if self.view.stream_clients:
+                    self.view.frame_cond.notify_all()
             self.view.fps = round(fps, 1)
             self.view.frame_count = self._frame_count
             self.view.event_count = self._event_count

@@ -61,7 +61,6 @@ nav {
 
 .nav-btn:hover { color: var(--text); border-color: var(--text-dim); background: var(--bg-hover); }
 .nav-btn.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.nav-btn.disabled { opacity: 0.35; pointer-events: none; }
 
 #status-bar {
     display: flex;
@@ -71,18 +70,6 @@ nav {
     font-size: 13px;
     color: var(--text-dim);
 }
-
-.dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    display: inline-block;
-}
-
-.dot.idle { background: var(--text-dim); }
-.dot.recording { background: var(--red); animation: pulse 1s infinite; }
-.dot.cooldown { background: var(--orange); }
-.dot.offline { background: #6b6157; }
 
 #status-recording { display: inline-flex; align-items: center; gap: 6px; }
 .rec-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); display: inline-block; animation: pulse 1s infinite; }
@@ -120,6 +107,7 @@ nav {
     aspect-ratio: 16/9;
     background: #000;
     overflow: hidden;
+    contain: paint;
 }
 
 .tile-stream-wrap img.tile-stream {
@@ -234,30 +222,6 @@ main {
 .view { display: none; }
 .view.active { display: block; }
 
-.stream-container {
-    display: flex;
-    justify-content: center;
-    background: #000;
-    border-radius: 8px;
-    overflow: hidden;
-}
-
-.stream-container img {
-    width: 100%;
-    height: auto;
-}
-
-.offline-msg {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 100%;
-    min-height: 400px;
-    color: var(--text-dim);
-    font-size: 20px;
-    letter-spacing: 1px;
-}
-
 .events-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
@@ -272,6 +236,8 @@ main {
     cursor: pointer;
     transition: border-color 0.15s, transform 0.1s, box-shadow 0.15s;
     box-shadow: var(--shadow);
+    content-visibility: auto;
+    contain-intrinsic-size: auto 260px;
 }
 
 .event-card:hover {

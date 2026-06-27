@@ -23,6 +23,11 @@ from .zones import ZoneFilter, Zone
 
 logger = logging.getLogger(__name__)
 
+# A /stream client re-sends its last frame after this long without a new one. Werkzeug
+# only detects a vanished client on the next write, so without this an unbounded wait on
+# a stalled/offline camera would leak the worker thread + its stream_clients slot.
+_STREAM_KEEPALIVE_S = 2.0
+
 
 _LOGIN_PAGE = """<!doctype html>
 <html lang="en">
@@ -80,6 +85,16 @@ class CameraView:
     connected: bool = False
     last_error: str = ''
     last_update: float = 0.0
+    frame_version: int = 0
+    frame_jpeg: bytes | None = None
+    jpeg_version: int = 0
+    stream_clients: int = 0
+    frame_cond: threading.Condition = field(init=False)
+
+    def __post_init__(self):
+        # One mutex for the whole feed path: the Condition wraps frame_lock,
+        # so existing `with view.frame_lock:` sites still serialise correctly.
+        self.frame_cond = threading.Condition(self.frame_lock)
 
 
 @dataclass
@@ -202,6 +217,7 @@ def create_app(state: CamerasState) -> Flask:
     def cameras():
         cam_cfgs = getattr(state.config, 'cameras', {}) if state.config else {}
         include_disabled = request.args.get('include_disabled') == 'true'
+        counts = state.db.get_camera_counts() if state.db else {}
         out = []
         for name, cam in cam_cfgs.items():
             enabled = getattr(cam, 'enabled', True)
@@ -218,7 +234,7 @@ def create_app(state: CamerasState) -> Flask:
                 'connected': view.connected if view else False,
                 'last_error': view.last_error if view else '',
                 'frame_count': view.frame_count if view else 0,
-                'event_count': state.db.get_event_count(camera=name) if state.db else 0,
+                'event_count': counts.get(name, 0),
             })
         return jsonify(out)
 
@@ -227,19 +243,35 @@ def create_app(state: CamerasState) -> Flask:
         view = _get_view(name)
 
         def generate():
-            while True:
-                with view.frame_lock:
-                    frame = view.frame
-                if frame is not None:
-                    _, jpeg = cv2.imencode(
-                        '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85]
-                    )
+            cond = view.frame_cond
+            with cond:
+                view.stream_clients += 1
+                cond.notify_all()
+            last_sent = 0
+            try:
+                while True:
+                    with cond:
+                        # Wake on a new frame, or every _STREAM_KEEPALIVE_S to re-send the
+                        # last one — a write the producer's stall would otherwise withhold,
+                        # leaving a disconnect (and this worker thread) undetected.
+                        cond.wait_for(
+                            lambda: view.jpeg_version != last_sent
+                            and view.frame_jpeg is not None,
+                            _STREAM_KEEPALIVE_S,
+                        )
+                        jpeg = view.frame_jpeg
+                        last_sent = view.jpeg_version
+                    if jpeg is None:
+                        continue
                     yield (
                         b'--frame\r\n'
                         b'Content-Type: image/jpeg\r\n\r\n'
-                        + jpeg.tobytes() + b'\r\n'
+                        + jpeg + b'\r\n'
                     )
-                time.sleep(0.033)
+            finally:
+                with cond:
+                    view.stream_clients -= 1
+                    cond.notify_all()
 
         return Response(
             generate(),
@@ -550,6 +582,15 @@ def create_app(state: CamerasState) -> Flask:
         path.unlink()
         return jsonify({'deleted': filename})
 
+    @app.after_request
+    def _static_cache(resp):
+        # Cache only /static/* (app.js/style.css); ETag/Last-Modified stay intact
+        # so the browser still 304-revalidates after expiry. index.html ('/') and
+        # event media keep their default no-cache so the app shell is never stale.
+        if request.endpoint == 'static':
+            resp.headers['Cache-Control'] = 'public, max-age=3600'
+        return resp
+
     return app
 
 
@@ -563,11 +604,23 @@ def _event_output_dir(state: CamerasState, event: dict) -> Path:
     return state.output_dir.resolve()
 
 
-def _get_storage_info(state: CamerasState) -> dict:
+# Storage info is cached per-process (one Flask app per process) so /api/status
+# never blocks on the NFS recordings walk; at most one background scan runs per TTL.
+_STORAGE_TTL = 30.0
+_storage_lock = threading.Lock()
+_storage_cache: dict | None = None
+_storage_cache_ts = 0.0
+_storage_refreshing = False
+
+
+def _scan_recordings_bytes(state: CamerasState) -> int:
     out = state.output_dir
-    recordings_bytes = sum(
-        f.stat().st_size for f in out.rglob('*') if f.is_file()
-    ) if out.exists() else 0
+    if not out.exists():
+        return 0
+    return sum(f.stat().st_size for f in out.rglob('*') if f.is_file())
+
+
+def _build_storage_info(state: CamerasState, recordings_bytes: int) -> dict:
     cfg = state.config
     rec_cfg = getattr(cfg, 'recording', None) if cfg else None
     max_gb = rec_cfg.retention.max_storage_gb if rec_cfg else 0
@@ -576,7 +629,7 @@ def _get_storage_info(state: CamerasState) -> dict:
         budget_free = max(0, budget_bytes - recordings_bytes)
     else:
         try:
-            stat = os.statvfs(str(out))
+            stat = os.statvfs(str(state.output_dir))
             budget_bytes = stat.f_blocks * stat.f_frsize
             budget_free = stat.f_bavail * stat.f_frsize
         except OSError:
@@ -589,6 +642,37 @@ def _get_storage_info(state: CamerasState) -> dict:
         'disk_free_bytes': budget_free,
         'disk_free_human': _human_size(budget_free),
     }
+
+
+def _refresh_storage_cache(state: CamerasState):
+    global _storage_cache, _storage_cache_ts, _storage_refreshing
+    try:
+        info = _build_storage_info(state, _scan_recordings_bytes(state))
+        with _storage_lock:
+            _storage_cache = info
+            _storage_cache_ts = time.monotonic()
+    except OSError:
+        logger.debug('storage scan failed; keeping previous value', exc_info=True)
+    finally:
+        with _storage_lock:
+            _storage_refreshing = False
+
+
+def _get_storage_info(state: CamerasState) -> dict:
+    global _storage_refreshing
+    now = time.monotonic()
+    with _storage_lock:
+        cached = _storage_cache
+        fresh = cached is not None and (now - _storage_cache_ts) < _STORAGE_TTL
+        if fresh:
+            return cached
+        spawn = not _storage_refreshing
+        if spawn:
+            _storage_refreshing = True
+    if spawn:
+        threading.Thread(target=_refresh_storage_cache, args=(state,),
+                         daemon=True, name='storage-refresh').start()
+    return cached if cached is not None else _build_storage_info(state, 0)
 
 
 def _safe_path(base: Path, *parts: str) -> Path:
@@ -649,7 +733,7 @@ def _send_video(path: str) -> Response:
                 f.seek(byte_start)
                 remaining = content_length
                 while remaining > 0:
-                    chunk = f.read(min(8192, remaining))
+                    chunk = f.read(min(262144, remaining))
                     if not chunk:
                         break
                     remaining -= len(chunk)
@@ -666,10 +750,38 @@ def _send_video(path: str) -> Response:
     return send_file(path, mimetype='video/mp4')
 
 
+def _encode_loop(view: CameraView):
+    # One shared encoder per camera: encodes each produced frame at most once and
+    # fans the bytes out to every /stream client. Blocks (≈0 CPU) while unwatched;
+    # imencode always runs OUTSIDE the lock on a reference copied under it (the
+    # producer rebinds view.frame to a fresh array each tick, never mutates in place).
+    cond = view.frame_cond
+    last = -1
+    while True:
+        with cond:
+            while not (view.stream_clients and view.frame is not None
+                       and view.frame_version != last):
+                cond.wait()
+            frame = view.frame
+            version = view.frame_version
+        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        jpeg = buf.tobytes() if ok else None
+        with cond:
+            last = version
+            if jpeg is not None:
+                view.frame_jpeg = jpeg
+                view.jpeg_version += 1
+                cond.notify_all()
+
+
 def start_api_server(state: CamerasState, port: int, host: str = '0.0.0.0') -> threading.Thread:
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.WARNING)
     app = create_app(state)
+
+    for v in state.views.values():
+        threading.Thread(target=_encode_loop, args=(v,), daemon=True,
+                         name=f'jpeg-{v.name}').start()
 
     def _serve():
         try:
