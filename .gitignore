@@ -69,6 +69,11 @@ output/
 
 # OpenVINO IR models (exported per-machine)
 *_openvino_model/
+models/yolov8n_openvino_model
+models/.prev_active
+
+# OpenVINO GPU kernel diagnostic dump (regenerated on GPU kernel warnings)
+kernel.errors.txt
 
 # Windows Zone.Identifier streams (WSL artifact)
 *:Zone.Identifier
