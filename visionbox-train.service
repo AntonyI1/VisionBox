@@ -1,0 +1,18 @@
+[Unit]
+Description=VisionBox nightly self-training (assemble -> train -> gate -> stage/promote)
+After=network-online.target visionbox.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=night
+Group=night
+WorkingDirectory=/home/night/VisionBox
+# Yield to live surveillance: training is best-effort and never starves the cameras.
+Nice=15
+CPUWeight=20
+IOSchedulingClass=idle
+# Stage-only by default. Uncomment to hot-swap whenever the regression gate passes:
+#Environment=AUTO_PROMOTE=1
+ExecStart=/home/night/VisionBox/scripts/training/run_overnight.sh
+TimeoutStartSec=6h
