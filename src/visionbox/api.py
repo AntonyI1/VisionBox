@@ -31,31 +31,29 @@ _LOGIN_PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VisionBox · Sign in</title>
 <style>
-  :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-         font-family: system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-         background:radial-gradient(1200px 600px at 50% -10%,#1b1e26,#0e0f13); color:#e6e7ea; }
-  .card { width:min(92vw,360px); background:#181a20; border:1px solid #262a33; border-radius:14px;
-          padding:30px 28px; box-shadow:0 14px 50px rgba(0,0,0,.5); }
-  .brand { display:flex; align-items:center; gap:11px; margin-bottom:24px; }
-  .dot { width:11px; height:11px; border-radius:50%; background:#3ddc84; box-shadow:0 0 12px #3ddc84; }
-  .brand h1 { font-size:19px; margin:0; font-weight:600; }
-  .brand small { color:#8b909a; font-size:12px; }
-  label { display:block; font-size:12px; color:#9aa0ab; margin:15px 0 6px; }
-  input { width:100%; padding:11px 12px; background:#0e0f13; border:1px solid #2b303a; border-radius:9px;
-          color:#e6e7ea; font-size:14px; outline:none; transition:border-color .15s; }
-  input:focus { border-color:#3ddc84; }
-  button { width:100%; margin-top:24px; padding:11px; background:#3ddc84; color:#06210f; border:0;
-           border-radius:9px; font-size:14px; font-weight:650; cursor:pointer; }
-  button:hover { background:#34c878; }
-  .err { margin-top:15px; min-height:16px; color:#ff6b6b; font-size:13px; text-align:center; }
-  .foot { margin-top:18px; text-align:center; color:#5d626c; font-size:11px; }
+         font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:radial-gradient(1100px 520px at 50% -8%,#241d15,#15110c); color:#ece3d6; }
+  .card { width:min(92vw,360px); background:#221d17; border:1px solid #3a3229; border-radius:14px;
+          padding:32px 30px; box-shadow:0 16px 50px rgba(0,0,0,.55); }
+  .brand { margin-bottom:24px; }
+  .brand h1 { font-size:19px; margin:0; font-weight:600; color:#ece3d6; }
+  .brand small { color:#9d8f7c; font-size:12px; }
+  label { display:block; font-size:12px; color:#a2937f; margin:15px 0 6px; font-weight:500; }
+  input { width:100%; padding:11px 12px; background:#1a1510; border:1px solid #3a3229; border-radius:9px;
+          color:#ece3d6; font-size:14px; outline:none; transition:border-color .15s,background .15s; }
+  input:focus { border-color:#cda06d; background:#1f1a13; }
+  button { width:100%; margin-top:24px; padding:12px; background:#cda06d; color:#221a12; border:0;
+           border-radius:9px; font-size:14px; font-weight:600; cursor:pointer; transition:background .15s; }
+  button:hover { background:#dbb184; }
+  .err { margin-top:15px; min-height:16px; color:#e0715c; font-size:13px; text-align:center; }
+  .foot { margin-top:18px; text-align:center; color:#7c6f5f; font-size:11px; }
 </style>
 </head>
 <body>
   <form class="card" method="post" action="">
-    <div class="brand"><span class="dot"></span><div><h1>VisionBox</h1><small>Surveillance dashboard</small></div></div>
+    <div class="brand"><h1>VisionBox</h1><small>Surveillance dashboard</small></div>
     <label for="u">Username</label>
     <input id="u" name="username" value="__USER__" autocomplete="username">
     <label for="p">Password</label>
