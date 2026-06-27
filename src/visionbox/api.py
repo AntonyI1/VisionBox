@@ -1,11 +1,13 @@
-"""Flask API server for VisionBox web UI and REST endpoints."""
+"""Flask API server for VisionBox multi-camera dashboard."""
 
+import hmac
+import json
 import logging
 import os
 import re
 import shutil
-import time
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -22,70 +24,96 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class PipelineState:
+class CameraView:
+    """Per-camera shared state (frame buffer + stats) exposed to the web."""
+    name: str
     frame: np.ndarray | None = None
     frame_lock: threading.Lock = field(default_factory=threading.Lock)
-    recording_mgr: RecordingManager | None = None
-    zone_filter: ZoneFilter | None = None
-    config: object = None
     fps: float = 0.0
     frame_count: int = 0
     event_count: int = 0
-    start_time: float = field(default_factory=time.time)
+    recording: bool = False
+    state: str = 'idle'
+    connected: bool = False
+    last_error: str = ''
+    last_update: float = 0.0
+
+
+@dataclass
+class CamerasState:
+    """Top-level shared state passed to the API server."""
+    config: object = None
+    db: RecordingDatabase | None = None
+    output_dir: Path = field(default_factory=lambda: Path('.'))
     crops_dir: Path = field(default_factory=lambda: Path('captures/crops'))
     training_dir: Path = field(default_factory=lambda: Path('datasets/training'))
+    zones_dir: Path = field(default_factory=lambda: Path('zones'))
+    start_time: float = field(default_factory=time.time)
     offline: bool = False
-    db: RecordingDatabase | None = None
-    output_dir: Path | None = None
+    views: dict[str, CameraView] = field(default_factory=dict)
+    zone_filters: dict[str, ZoneFilter] = field(default_factory=dict)
+    recording_mgrs: dict[str, RecordingManager] = field(default_factory=dict)
+    detector: object = None          # MultiModelDetector (None in UI-only mode)
+    detector_lock: object = None     # held during inference + hot-swap reload
+
+    def add_camera(self, view: CameraView, zone_filter: ZoneFilter, rec_mgr: RecordingManager):
+        self.views[view.name] = view
+        self.zone_filters[view.name] = zone_filter
+        self.recording_mgrs[view.name] = rec_mgr
 
 
-def create_app(state: PipelineState) -> Flask:
+def create_app(state: CamerasState) -> Flask:
     app = Flask(
         __name__,
         static_folder=os.path.join(os.path.dirname(__file__), 'web'),
         static_url_path='/static',
     )
 
-    def _db() -> RecordingDatabase:
-        if state.db:
-            return state.db
-        return state.recording_mgr.db
+    # Optional HTTP Basic auth, gated on VISIONBOX_AUTH_USER/PASS (keep them in .env —
+    # chmod 600 + gitignored). Fails CLOSED: setting only one of the pair is a hard
+    # error, never silently-open. No localhost exemption — on-box callers reload the
+    # model via SIGHUP, not this endpoint — so a same-host proxy cannot bypass auth.
+    _auth_user = os.environ.get('VISIONBOX_AUTH_USER', '')
+    _auth_pass = os.environ.get('VISIONBOX_AUTH_PASS', '')
+    if bool(_auth_user) != bool(_auth_pass):
+        raise SystemExit('VISIONBOX_AUTH_USER and VISIONBOX_AUTH_PASS must both be set '
+                         '(or both unset to disable auth).')
+    if _auth_user and _auth_pass:
+        _user_b = _auth_user.encode('utf-8')
+        _pass_b = _auth_pass.encode('utf-8')
 
-    def _output_dir() -> Path:
-        if state.output_dir:
-            return state.output_dir.resolve()
-        return state.recording_mgr.output_dir.resolve()
+        @app.before_request
+        def _require_auth():
+            auth = request.authorization
+            if auth and auth.type == 'basic':
+                try:
+                    ok = (hmac.compare_digest((auth.username or '').encode('utf-8'), _user_b)
+                          & hmac.compare_digest((auth.password or '').encode('utf-8'), _pass_b))
+                except (TypeError, UnicodeError):
+                    ok = False
+                if ok:
+                    return None
+            return Response('Authentication required', 401,
+                            {'WWW-Authenticate': 'Basic realm="VisionBox"'})
+        logger.info('dashboard auth: ENABLED (HTTP Basic)')
+    else:
+        logger.warning('dashboard auth: DISABLED — set VISIONBOX_AUTH_USER/PASS in .env')
 
-    def _get_storage_info() -> dict:
-        if state.output_dir:
-            out = state.output_dir.resolve()
-        elif state.recording_mgr:
-            out = state.recording_mgr.output_dir.resolve()
-        else:
-            out = Path('.')
-        recordings_bytes = sum(
-            f.stat().st_size for f in out.rglob('*') if f.is_file()
-        ) if out.exists() else 0
-        mgr = state.recording_mgr
-        max_gb = mgr.config.retention.max_storage_gb if mgr else 0
-        if max_gb > 0:
-            budget_bytes = int(max_gb * 1024 * 1024 * 1024)
-            budget_free = max(0, budget_bytes - recordings_bytes)
-        else:
-            try:
-                stat = os.statvfs(str(out))
-                budget_bytes = stat.f_blocks * stat.f_frsize
-                budget_free = stat.f_bavail * stat.f_frsize
-            except OSError:
-                budget_bytes = budget_free = 0
-        return {
-            'recordings_bytes': recordings_bytes,
-            'recordings_human': _human_size(recordings_bytes),
-            'disk_total_bytes': budget_bytes,
-            'disk_total_human': _human_size(budget_bytes),
-            'disk_free_bytes': budget_free,
-            'disk_free_human': _human_size(budget_free),
-        }
+    def _get_view(name: str) -> CameraView:
+        if name not in state.views:
+            abort(404)
+        return state.views[name]
+
+    def _get_zone_filter(name: str) -> ZoneFilter:
+        if name not in state.zone_filters:
+            # Allow offline mode to read zones from disk
+            zpath = state.zones_dir / f'{name}.json'
+            if not zpath.exists():
+                abort(404)
+            zf = ZoneFilter(str(zpath))
+            state.zone_filters[name] = zf
+            return zf
+        return state.zone_filters[name]
 
     @app.route('/')
     def index():
@@ -94,24 +122,48 @@ def create_app(state: PipelineState) -> Flask:
             mimetype='text/html',
         )
 
-    @app.route('/api/stream')
-    def stream():
-        if state.offline:
-            abort(503)
+    # ----- Cameras -----
+
+    @app.route('/api/cameras')
+    def cameras():
+        cam_cfgs = getattr(state.config, 'cameras', {}) if state.config else {}
+        include_disabled = request.args.get('include_disabled') == 'true'
+        out = []
+        for name, cam in cam_cfgs.items():
+            enabled = getattr(cam, 'enabled', True)
+            if not enabled and not include_disabled:
+                continue
+            view = state.views.get(name)
+            mgr = state.recording_mgrs.get(name)
+            out.append({
+                'name': name,
+                'enabled': enabled,
+                'fps': view.fps if view else 0,
+                'recording': view.recording if view else False,
+                'state': view.state if view else 'offline',
+                'connected': view.connected if view else False,
+                'last_error': view.last_error if view else '',
+                'frame_count': view.frame_count if view else 0,
+                'event_count': state.db.get_event_count(camera=name) if state.db else 0,
+            })
+        return jsonify(out)
+
+    @app.route('/api/cameras/<name>/stream')
+    def camera_stream(name):
+        view = _get_view(name)
 
         def generate():
             while True:
-                with state.frame_lock:
-                    frame = state.frame
+                with view.frame_lock:
+                    frame = view.frame
                 if frame is not None:
                     _, jpeg = cv2.imencode(
-                        '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                        '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85]
                     )
                     yield (
                         b'--frame\r\n'
                         b'Content-Type: image/jpeg\r\n\r\n'
-                        + jpeg.tobytes()
-                        + b'\r\n'
+                        + jpeg.tobytes() + b'\r\n'
                     )
                 time.sleep(0.033)
 
@@ -120,115 +172,159 @@ def create_app(state: PipelineState) -> Flask:
             mimetype='multipart/x-mixed-replace; boundary=frame',
         )
 
+    @app.route('/api/cameras/<name>/snapshot')
+    def camera_snapshot(name):
+        view = _get_view(name)
+        with view.frame_lock:
+            frame = view.frame
+        if frame is None:
+            abort(503)
+        _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return Response(jpeg.tobytes(), mimetype='image/jpeg')
+
+    # ----- Status -----
+
     @app.route('/api/status')
     def status():
-        mgr = state.recording_mgr
-        storage = _get_storage_info()
-        if state.offline:
-            db = _db()
-            return jsonify({
-                'recording': False,
-                'state': 'offline',
-                'fps': 0,
-                'frame_count': 0,
-                'event_count': db.get_event_count() if db else 0,
-                'uptime': round(time.time() - state.start_time),
-                'storage': storage,
-            })
+        cams = list(state.views.values())
+        any_recording = any(v.recording for v in cams)
+        storage = _get_storage_info(state)
         return jsonify({
-            'recording': mgr.is_recording if mgr else False,
-            'state': mgr.state.value if mgr else 'idle',
-            'fps': round(state.fps, 1),
-            'frame_count': state.frame_count,
-            'event_count': state.event_count,
+            'offline': state.offline,
+            'cameras': len(cams),
+            'connected_cameras': sum(1 for v in cams if v.connected),
+            'recording_cameras': sum(1 for v in cams if v.recording),
+            'any_recording': any_recording,
+            'event_count': state.db.get_event_count() if state.db else 0,
             'uptime': round(time.time() - state.start_time),
             'storage': storage,
         })
 
+    # ----- Events -----
+
     @app.route('/api/events')
     def events():
-        limit = request.args.get('limit', 50, type=int)
+        limit = min(request.args.get('limit', 50, type=int), 200)
         offset = request.args.get('offset', 0, type=int)
-        limit = min(limit, 200)
-
-        rows = _db().get_events(limit=limit, offset=offset)
-        total = _db().get_event_count()
+        camera = request.args.get('camera') or None
+        rows = state.db.get_events(limit=limit, offset=offset, camera=camera)
+        total = state.db.get_event_count(camera=camera)
         return jsonify({
-            'events': rows,
-            'total': total,
-            'limit': limit,
-            'offset': offset,
+            'events': rows, 'total': total, 'limit': limit, 'offset': offset,
         })
 
     @app.route('/api/events/<event_id>')
     def event_detail(event_id):
-        event = _db().get_event(event_id)
+        event = state.db.get_event(event_id)
         if not event:
             abort(404)
         return jsonify(event)
 
     @app.route('/api/events/<event_id>', methods=['DELETE'])
     def delete_event(event_id):
-        event = _db().get_event(event_id)
+        event = state.db.get_event(event_id)
         if not event:
             abort(404)
-
-        out = _output_dir()
-        for key in ('clean_clip', 'annotated_clip', 'thumbnail'):
+        cam_out = _event_output_dir(state, event)
+        for key in ('clean_clip', 'annotated_clip', 'thumbnail', 'snapshot'):
             rel = event.get(key, '')
             if rel:
-                p = Path(rel)
-                if not p.is_absolute():
-                    p = out / p
+                p = Path(rel) if Path(rel).is_absolute() else cam_out / rel
                 if p.exists():
                     p.unlink()
-                if key != 'thumbnail':
+                if key not in ('thumbnail', 'snapshot'):
                     meta = p.with_suffix('.json')
                     if meta.exists():
                         meta.unlink()
-
-        _db().delete_event(event_id)
+        state.db.delete_event(event_id)
         return jsonify({'deleted': event_id})
 
     @app.route('/api/events/<event_id>/thumbnail')
     def event_thumbnail(event_id):
-        event = _db().get_event(event_id)
+        event = state.db.get_event(event_id)
         if not event or not event.get('thumbnail'):
             abort(404)
-
         thumb_path = Path(event['thumbnail'])
         if not thumb_path.is_absolute():
-            thumb_path = _output_dir() / thumb_path
+            thumb_path = _event_output_dir(state, event) / thumb_path
         if not thumb_path.exists():
             abort(404)
-
         return send_file(str(thumb_path), mimetype='image/jpeg')
+
+    @app.route('/api/events/<event_id>/snapshot')
+    def event_snapshot(event_id):
+        event = state.db.get_event(event_id)
+        if not event or not event.get('snapshot'):
+            abort(404)
+        snap_path = Path(event['snapshot'])
+        if not snap_path.is_absolute():
+            snap_path = _event_output_dir(state, event) / snap_path
+        if not snap_path.exists():
+            abort(404)
+        return send_file(str(snap_path), mimetype='image/jpeg')
+
+    # ----- Model / self-training -----
+    @app.route('/api/model/reload', methods=['POST'])
+    def model_reload():
+        """Hot-swap the on-disk model into the running detector (after promotion)."""
+        if state.detector is None or state.detector_lock is None:
+            return jsonify({'ok': False, 'error': 'no detector in this process'}), 409
+        try:
+            info = state.detector.reload(swap_lock=state.detector_lock)
+            return jsonify({'ok': True, **info})
+        except Exception as exc:
+            logger.exception('model reload failed')
+            return jsonify({'ok': False, 'error': f'{type(exc).__name__}: {exc}'}), 500
+
+    @app.route('/api/model/status')
+    def model_status():
+        root = Path(__file__).resolve().parents[2]
+        active = root / 'models' / 'yolov8n_openvino_model'
+        target = None
+        try:
+            if active.is_symlink():
+                target = os.readlink(str(active))
+        except OSError:
+            target = None
+        report, latest = None, None
+        runs = sorted((root / 'runs' / 'train').glob('overnight_*/REPORT.json'))
+        if runs:
+            latest = runs[-1].parent.name
+            try:
+                with open(runs[-1]) as f:
+                    report = json.load(f)
+            except (OSError, ValueError):
+                report = None
+        return jsonify({
+            'loaded': state.detector is not None,
+            'active_model': str(active),
+            'active_target': target,
+            'classes': len(state.detector.class_names) if state.detector else None,
+            'device': state.detector.effective_device if state.detector else None,
+            'latest_run': latest,
+            'latest_report': report,
+        })
 
     @app.route('/api/events/<event_id>/clip/<clip_type>')
     def event_clip(event_id, clip_type):
         if clip_type not in ('clean', 'annotated'):
             abort(400)
-
-        event = _db().get_event(event_id)
+        event = state.db.get_event(event_id)
         if not event:
             abort(404)
-
-        key = f'{clip_type}_clip'
-        rel = event.get(key, '')
+        rel = event.get(f'{clip_type}_clip', '')
         if not rel:
             abort(404)
-
         clip_path = Path(rel)
         if not clip_path.is_absolute():
-            clip_path = _output_dir() / clip_path
-
+            clip_path = _event_output_dir(state, event) / clip_path
         h264_path = clip_path.with_name(clip_path.stem + '.h264.mp4')
         serve_path = h264_path if h264_path.exists() else clip_path
-
         if not serve_path.exists():
             abort(404)
-
         return _send_video(str(serve_path))
+
+    # ----- Config -----
 
     @app.route('/api/config')
     def config():
@@ -237,25 +333,21 @@ def create_app(state: PipelineState) -> Flask:
         from dataclasses import asdict
         return jsonify(asdict(state.config))
 
-    @app.route('/api/zones')
-    def get_zones():
-        if not state.zone_filter:
-            return jsonify([])
-        return jsonify(state.zone_filter.get_zones())
+    # ----- Zones (per camera) -----
 
-    @app.route('/api/zones', methods=['POST'])
-    def add_zone():
-        if not state.zone_filter:
-            abort(500)
-        data = request.get_json()
-        if not data:
-            abort(400)
+    @app.route('/api/cameras/<name>/zones')
+    def get_zones(name):
+        zf = _get_zone_filter(name)
+        return jsonify(zf.get_zones())
 
-        name = data.get('name', '').strip()
+    @app.route('/api/cameras/<name>/zones', methods=['POST'])
+    def add_zone(name):
+        zf = _get_zone_filter(name)
+        data = request.get_json() or {}
+        zname = data.get('name', '').strip()
         ztype = data.get('type', '')
         points = data.get('points', [])
-
-        if not name:
+        if not zname:
             return jsonify({'error': 'Name required'}), 400
         if ztype not in ('include', 'exclude'):
             return jsonify({'error': 'Type must be include or exclude'}), 400
@@ -266,73 +358,25 @@ def create_app(state: PipelineState) -> Flask:
                 return jsonify({'error': 'Points must be [x, y] pairs'}), 400
             if not all(0 <= v <= 1 for v in p):
                 return jsonify({'error': 'Coordinates must be 0-1'}), 400
-
-        state.zone_filter.add_zone(Zone(name=name, type=ztype, points=points))
+        zf.add_zone(Zone(name=zname, type=ztype, points=points))
         return jsonify({'ok': True})
 
-    @app.route('/api/zones/<name>', methods=['DELETE'])
-    def delete_zone(name):
-        if not state.zone_filter:
-            abort(500)
-        if state.zone_filter.remove_zone(name):
-            return jsonify({'deleted': name})
+    @app.route('/api/cameras/<name>/zones/<zname>', methods=['DELETE'])
+    def delete_zone(name, zname):
+        zf = _get_zone_filter(name)
+        if zf.remove_zone(zname):
+            return jsonify({'deleted': zname})
         abort(404)
 
-    @app.route('/api/snapshot')
-    def snapshot():
-        with state.frame_lock:
-            frame = state.frame
-        if frame is None:
-            abort(503)
-        _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        return Response(jpeg.tobytes(), mimetype='image/jpeg')
+    # ----- Review (per camera, per class) -----
 
-    # --- Helpers ---
-
-    def _safe_path(base: Path, *parts: str) -> Path:
-        resolved = (base / Path(*parts)).resolve()
-        if not resolved.is_relative_to(base.resolve()):
-            abort(400)
-        return resolved
-
-    def _parse_crop_filename(filename):
-        """Parse track{id}_{YYYYMMDD}_{HHMMSS}_{confidence}.jpg"""
-        m = re.match(
-            r'track(\d+)_(\d{8})_(\d{6})_\d*_?(\d+\.\d+)\.jpg$', filename
-        )
-        if not m:
-            return None
-        track_id = int(m.group(1))
-        date_str, time_str = m.group(2), m.group(3)
-        confidence = float(m.group(4))
-        try:
-            timestamp = datetime.strptime(
-                f'{date_str}_{time_str}', '%Y%m%d_%H%M%S'
-            )
-        except ValueError:
-            timestamp = None
-        return {
-            'track_id': track_id,
-            'timestamp': timestamp.isoformat() if timestamp else None,
-            'confidence': round(confidence, 2),
-        }
-
-    def _list_images(base_dir: Path, class_name: str):
-        class_dir = _safe_path(base_dir, class_name)
-        if not class_dir.is_dir():
-            return []
-        return sorted(
-            f.name for f in class_dir.iterdir()
-            if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
-        )
-
-    @app.route('/api/review/classes')
-    def review_classes():
-        crops = state.crops_dir
-        if not crops.is_dir():
+    @app.route('/api/cameras/<name>/review/classes')
+    def review_classes(name):
+        cam_crops = state.crops_dir / name
+        if not cam_crops.is_dir():
             return jsonify([])
-        classes = []
-        for d in sorted(crops.iterdir()):
+        out = []
+        for d in sorted(cam_crops.iterdir()):
             if not d.is_dir():
                 continue
             count = sum(
@@ -340,65 +384,59 @@ def create_app(state: PipelineState) -> Flask:
                 if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
             )
             if count > 0:
-                classes.append({'name': d.name, 'count': count})
-        return jsonify(classes)
+                out.append({'name': d.name, 'count': count})
+        return jsonify(out)
 
-    @app.route('/api/review/<class_name>')
-    def review_crop(class_name):
+    @app.route('/api/cameras/<name>/review/<class_name>')
+    def review_crop(name, class_name):
         offset = request.args.get('offset', 0, type=int)
-        files = _list_images(state.crops_dir, class_name)
+        files = _list_images(state.crops_dir / name, class_name)
         if not files:
             return jsonify({'total': 0, 'offset': offset, 'crop': None})
-
         offset = max(0, min(offset, len(files) - 1))
         filename = files[offset]
         meta = _parse_crop_filename(filename) or {}
         meta['filename'] = filename
         meta['class'] = class_name
-        return jsonify({
-            'total': len(files),
-            'offset': offset,
-            'crop': meta,
-        })
+        meta['camera'] = name
+        return jsonify({'total': len(files), 'offset': offset, 'crop': meta})
 
-    @app.route('/api/review/<class_name>/<filename>/image')
-    def review_image(class_name, filename):
-        path = _safe_path(state.crops_dir, class_name, filename)
+    @app.route('/api/cameras/<name>/review/<class_name>/<filename>/image')
+    def review_image(name, class_name, filename):
+        path = _safe_path(state.crops_dir / name, class_name, filename)
         if not path.is_file():
             abort(404)
         return send_file(str(path), mimetype='image/jpeg')
 
-    @app.route('/api/review/<class_name>/<filename>/approve', methods=['POST'])
-    def review_approve(class_name, filename):
-        src = _safe_path(state.crops_dir, class_name, filename)
+    @app.route('/api/cameras/<name>/review/<class_name>/<filename>/approve', methods=['POST'])
+    def review_approve(name, class_name, filename):
+        src = _safe_path(state.crops_dir / name, class_name, filename)
         if not src.is_file():
             abort(404)
-
         dest_dir = _safe_path(state.training_dir, class_name)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / filename
+        dest = dest_dir / f'{name}_{filename}'  # prefix with camera to avoid name collisions
         shutil.move(str(src), str(dest))
-        logger.info('Approved %s/%s → training', class_name, filename)
+        logger.info('Approved %s/%s/%s → training', name, class_name, filename)
         return jsonify({'action': 'approved', 'file': filename})
 
-    @app.route('/api/review/<class_name>/<filename>/reject', methods=['POST'])
-    def review_reject(class_name, filename):
-        src = _safe_path(state.crops_dir, class_name, filename)
+    @app.route('/api/cameras/<name>/review/<class_name>/<filename>/reject', methods=['POST'])
+    def review_reject(name, class_name, filename):
+        src = _safe_path(state.crops_dir / name, class_name, filename)
         if not src.is_file():
             abort(404)
-
         src.unlink()
-        logger.info('Rejected %s/%s (deleted)', class_name, filename)
+        logger.info('Rejected %s/%s/%s', name, class_name, filename)
         return jsonify({'action': 'rejected', 'file': filename})
 
-    # --- Training endpoints ---
+    # ----- Training (global pool) -----
 
     @app.route('/api/training/classes')
     def training_classes():
         tdir = state.training_dir
         if not tdir.is_dir():
             return jsonify([])
-        classes = []
+        out = []
         for d in sorted(tdir.iterdir()):
             if not d.is_dir():
                 continue
@@ -407,8 +445,8 @@ def create_app(state: PipelineState) -> Flask:
                 if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
             )
             if count > 0:
-                classes.append({'name': d.name, 'count': count})
-        return jsonify(classes)
+                out.append({'name': d.name, 'count': count})
+        return jsonify(out)
 
     @app.route('/api/training/<class_name>')
     def training_image(class_name):
@@ -416,17 +454,12 @@ def create_app(state: PipelineState) -> Flask:
         files = _list_images(state.training_dir, class_name)
         if not files:
             return jsonify({'total': 0, 'offset': offset, 'image': None})
-
         offset = max(0, min(offset, len(files) - 1))
         filename = files[offset]
         meta = _parse_crop_filename(filename) or {}
         meta['filename'] = filename
         meta['class'] = class_name
-        return jsonify({
-            'total': len(files),
-            'offset': offset,
-            'image': meta,
-        })
+        return jsonify({'total': len(files), 'offset': offset, 'image': meta})
 
     @app.route('/api/training/<class_name>/<filename>/image')
     def training_serve_image(class_name, filename):
@@ -441,10 +474,82 @@ def create_app(state: PipelineState) -> Flask:
         if not path.is_file():
             abort(404)
         path.unlink()
-        logger.info('Deleted training image %s/%s', class_name, filename)
         return jsonify({'deleted': filename})
 
     return app
+
+
+# ---------- Helpers ----------
+
+def _event_output_dir(state: CamerasState, event: dict) -> Path:
+    """Return the on-disk directory that owns an event's clips."""
+    camera = event.get('camera') or ''
+    if camera:
+        return (state.output_dir / camera).resolve()
+    return state.output_dir.resolve()
+
+
+def _get_storage_info(state: CamerasState) -> dict:
+    out = state.output_dir
+    recordings_bytes = sum(
+        f.stat().st_size for f in out.rglob('*') if f.is_file()
+    ) if out.exists() else 0
+    cfg = state.config
+    rec_cfg = getattr(cfg, 'recording', None) if cfg else None
+    max_gb = rec_cfg.retention.max_storage_gb if rec_cfg else 0
+    if max_gb > 0:
+        budget_bytes = int(max_gb * 1024 * 1024 * 1024)
+        budget_free = max(0, budget_bytes - recordings_bytes)
+    else:
+        try:
+            stat = os.statvfs(str(out))
+            budget_bytes = stat.f_blocks * stat.f_frsize
+            budget_free = stat.f_bavail * stat.f_frsize
+        except OSError:
+            budget_bytes = budget_free = 0
+    return {
+        'recordings_bytes': recordings_bytes,
+        'recordings_human': _human_size(recordings_bytes),
+        'disk_total_bytes': budget_bytes,
+        'disk_total_human': _human_size(budget_bytes),
+        'disk_free_bytes': budget_free,
+        'disk_free_human': _human_size(budget_free),
+    }
+
+
+def _safe_path(base: Path, *parts: str) -> Path:
+    resolved = (base / Path(*parts)).resolve()
+    if not resolved.is_relative_to(base.resolve()):
+        abort(400)
+    return resolved
+
+
+def _parse_crop_filename(filename):
+    """Parse track{id}_{YYYYMMDD}_{HHMMSS}[..._]{conf}.jpg with optional camera prefix."""
+    m = re.search(
+        r'track(\d+)_(\d{8})_(\d{6})_\d*_?(\d+\.\d+)\.jpg$', filename
+    )
+    if not m:
+        return None
+    try:
+        ts = datetime.strptime(f'{m.group(2)}_{m.group(3)}', '%Y%m%d_%H%M%S')
+    except ValueError:
+        ts = None
+    return {
+        'track_id': int(m.group(1)),
+        'timestamp': ts.isoformat() if ts else None,
+        'confidence': round(float(m.group(4)), 2),
+    }
+
+
+def _list_images(base_dir: Path, class_name: str):
+    class_dir = _safe_path(base_dir, class_name)
+    if not class_dir.is_dir():
+        return []
+    return sorted(
+        f.name for f in class_dir.iterdir()
+        if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
+    )
 
 
 def _human_size(nbytes: int) -> str:
@@ -459,16 +564,10 @@ def _send_video(path: str) -> Response:
     """Serve MP4 with Range header support for HTML5 video seeking."""
     file_size = os.path.getsize(path)
     range_header = request.headers.get('Range')
-
     if range_header:
-        byte_start = 0
-        byte_end = file_size - 1
-
         match = range_header.replace('bytes=', '').split('-')
         byte_start = int(match[0])
-        if match[1]:
-            byte_end = int(match[1])
-
+        byte_end = int(match[1]) if match[1] else file_size - 1
         content_length = byte_end - byte_start + 1
 
         def generate():
@@ -483,29 +582,36 @@ def _send_video(path: str) -> Response:
                     yield chunk
 
         return Response(
-            generate(),
-            status=206,
-            mimetype='video/mp4',
+            generate(), status=206, mimetype='video/mp4',
             headers={
                 'Content-Range': f'bytes {byte_start}-{byte_end}/{file_size}',
                 'Accept-Ranges': 'bytes',
                 'Content-Length': content_length,
             },
         )
-
     return send_file(path, mimetype='video/mp4')
 
 
-def start_api_server(state: PipelineState, port: int) -> threading.Thread:
+def start_api_server(state: CamerasState, port: int, host: str = '0.0.0.0') -> threading.Thread:
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.WARNING)
-
     app = create_app(state)
-    thread = threading.Thread(
-        target=lambda: app.run(
-            host='0.0.0.0', port=port, threaded=True, use_reloader=False,
-        ),
-        daemon=True,
-    )
+
+    def _serve():
+        try:
+            app.run(host=host, port=port, threaded=True, use_reloader=False)
+        except OSError as exc:
+            # A bad bind_host / taken port must fail LOUDLY (systemd restarts + logs),
+            # not die silently in this daemon thread while main() waits forever.
+            logger.error('API server could not bind %s:%s — %s', host, port, exc)
+            os._exit(1)
+
+    thread = threading.Thread(target=_serve, daemon=True, name='api-server')
     thread.start()
     return thread
+
+
+# ---------- Backwards-compat shims (kept light to avoid stale references) ----------
+
+# Old `PipelineState` import paths may still exist in saved scripts.
+PipelineState = CamerasState
