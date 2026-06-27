@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
-"""VisionBox surveillance pipeline. Config via config.yml."""
+"""VisionBox surveillance pipeline. Multi-camera, single process."""
 
 import argparse
+import json
+import math
 import os
+import re
 import signal
+import statistics
+import subprocess
 import sys
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
 sys.path.insert(0, 'src')
 
 from dotenv import load_dotenv
 load_dotenv()
 
+# Time out on stalled RTSP streams so the reconnect logic fires (must precede cv2 use).
+os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp|timeout;5000000')
+
 import cv2
-import time
-import json
-import threading
-import subprocess
 import numpy as np
-from pathlib import Path
-from datetime import datetime
+
 from visionbox import (
     Tracker,
     CLASS_PRESETS_V2,
@@ -25,11 +35,59 @@ from visionbox import (
     merge_overlapping_regions,
 )
 from visionbox.detector_v2 import MultiModelDetector, ModelConfig
-from visionbox.config import load_config
+from visionbox.config import load_config, CameraConfig, VisionBoxConfig
 from visionbox.database import RecordingDatabase
 from visionbox.recording_manager import RecordingManager
-from visionbox.api import PipelineState, start_api_server
+from visionbox.api import (
+    CamerasState, CameraView, start_api_server,
+)
 from visionbox.zones import ZoneFilter
+
+
+np.random.seed(42)
+COLORS = [(int(c[0]), int(c[1]), int(c[2])) for c in np.random.randint(0, 255, (100, 3))]
+
+
+def _redact_url(url: str) -> str:
+    """Strip credentials from an RTSP URL before logging."""
+    return re.sub(r'://[^/@]*@', '://***@', url)
+
+
+class CameraStream:
+    """Threaded RTSP reader — always returns the latest frame."""
+
+    def __init__(self, source):
+        self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.ret = False
+        self.frame = None
+        self.last_frame_time = time.time()
+        self.lock = threading.Lock()
+        self.stopped = False
+        threading.Thread(target=self._reader, daemon=True,
+                         name='rtsp-reader').start()
+
+    def _reader(self):
+        while not self.stopped:
+            ret, frame = self.cap.read()
+            with self.lock:
+                self.ret = ret
+                self.frame = frame
+            if ret and frame is not None:
+                self.last_frame_time = time.time()
+            else:
+                time.sleep(0.1)
+
+    def read(self):
+        with self.lock:
+            return self.ret, self.frame.copy() if self.frame is not None else None
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def release(self):
+        self.stopped = True
+        self.cap.release()
 
 
 def open_browser(url: str):
@@ -44,481 +102,28 @@ def open_browser(url: str):
                 pass
 
 
-np.random.seed(42)
-COLORS = [(int(c[0]), int(c[1]), int(c[2])) for c in np.random.randint(0, 255, (100, 3))]
-
-REVIEW_DIR = None
-CAPTURES_DIR = None
-DATASET_DIR = None
-
-
-class CameraStream:
-    """Threaded RTSP reader — always returns the latest frame."""
-
-    def __init__(self, source):
-        self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.ret = False
-        self.frame = None
-        self.lock = threading.Lock()
-        self.stopped = False
-        threading.Thread(target=self._reader, daemon=True).start()
-
-    def _reader(self):
-        while not self.stopped:
-            ret, frame = self.cap.read()
-            with self.lock:
-                self.ret = ret
-                self.frame = frame
-
-    def read(self):
-        with self.lock:
-            return self.ret, self.frame.copy() if self.frame is not None else None
-
-    def isOpened(self):
-        return self.cap.isOpened()
-
-    def release(self):
-        self.stopped = True
-        self.cap.release()
-
-
-
-def save_uncertain(frame, detections, timestamp_str):
-    img_path = REVIEW_DIR / f"{timestamp_str}.jpg"
-    cv2.imwrite(str(img_path), frame)
-
-    meta = {
-        'timestamp': timestamp_str,
-        'source': 'surveillance_auto',
-        'detections': [
-            {'class': d['class_name'], 'class_id': d['class_id'],
-             'confidence': round(d['confidence'], 3),
-             'box': [int(x) for x in d['box']]}
-            for d in detections
-        ]
-    }
-    with open(REVIEW_DIR / f"{timestamp_str}.json", 'w') as f:
-        json.dump(meta, f, indent=2)
-
-    h, w = frame.shape[:2]
-    with open(REVIEW_DIR / f"{timestamp_str}.txt", 'w') as f:
-        for d in detections:
-            x1, y1, x2, y2 = d['box']
-            cx, cy = ((x1 + x2) / 2) / w, ((y1 + y2) / 2) / h
-            bw, bh = (x2 - x1) / w, (y2 - y1) / h
-            f.write(f"{d['class_id']} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
-
-
-def save_crop(frame, box, track_id, class_name, confidence, padding=20):
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = [int(v) for v in box]
-    cx1, cy1 = max(0, x1 - padding), max(0, y1 - padding)
-    cx2, cy2 = min(w, x2 + padding), min(h, y2 + padding)
-    crop = frame[cy1:cy2, cx1:cx2]
-    if crop.size == 0:
-        return False
-
-    class_dir = CAPTURES_DIR / class_name.replace(' ', '_')
-    class_dir.mkdir(exist_ok=True)
-
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-    cv2.imwrite(str(class_dir / f"track{track_id}_{ts}_{confidence:.2f}.jpg"), crop)
-    return True
-
-
-def save_frame_with_labels(frame, capture_detections):
-    h, w = frame.shape[:2]
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-    cv2.imwrite(str(DATASET_DIR / 'images' / f"{ts}.jpg"), frame)
-
-    with open(DATASET_DIR / 'labels' / f"{ts}.txt", 'w') as f:
-        for det in capture_detections:
-            x1, y1, x2, y2 = det['box']
-            cx, cy = ((x1 + x2) / 2) / w, ((y1 + y2) / 2) / h
-            bw, bh = (x2 - x1) / w, (y2 - y1) / h
-            f.write(f"{det['class_id']} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
-
-
 def draw_tracks(image, tracks, track_info, class_names):
     for track in tracks:
         x1, y1, x2, y2, track_id = track
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         track_id = int(track_id)
-
         info = track_info.get(track_id)
         if info:
             class_id, class_name, conf = info['class_id'], info['class_name'], info['confidence']
         else:
             class_id, class_name, conf = 0, class_names.get(0, 'unknown'), 0
-
         color = COLORS[track_id % len(COLORS)]
         if class_id == 80:
             color = (0, 255, 255)
             label = f"PLATE #{track_id} {conf:.0%}"
         else:
             label = f"{class_name} #{track_id} {conf:.0%}"
-
         cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
         (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(image, (x1, y1 - h - 10), (x1 + w, y1), color, -1)
         cv2.putText(image, label, (x1, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
     return image
-
-
-def init_storage(cfg):
-    global REVIEW_DIR, CAPTURES_DIR, DATASET_DIR
-    REVIEW_DIR = Path(cfg.storage.review)
-    CAPTURES_DIR = Path(cfg.storage.crops)
-    DATASET_DIR = Path(cfg.storage.dataset)
-    for d in [REVIEW_DIR, CAPTURES_DIR, DATASET_DIR / 'images', DATASET_DIR / 'labels']:
-        d.mkdir(parents=True, exist_ok=True)
-
-
-def run_ui_only(cfg):
-    output_dir = Path(cfg.recording.output_dir)
-    db_path = output_dir / 'visionbox.db'
-    db = RecordingDatabase(db_path)
-    zone_filter = ZoneFilter(cfg.storage.zones)
-
-    api_state = PipelineState(
-        zone_filter=zone_filter,
-        config=cfg,
-        offline=True,
-        db=db,
-        output_dir=output_dir,
-        crops_dir=Path(cfg.storage.crops),
-        training_dir=Path(cfg.storage.training),
-    )
-
-    port = cfg.display.web_port
-    start_api_server(api_state, port)
-    print(f"VisionBox UI-only mode")
-    print(f"  Web UI: http://localhost:{port}")
-    print(f"  Database: {db_path}")
-    print(f"  Press Ctrl+C to stop")
-    open_browser(f'http://localhost:{port}')
-
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda s, f: stop.set())
-    signal.signal(signal.SIGTERM, lambda s, f: stop.set())
-    stop.wait()
-    db.close()
-
-
-def main():
-    parser = argparse.ArgumentParser(description='VisionBox Surveillance')
-    parser.add_argument('url', nargs='?', help='Camera URL (overrides config)')
-    parser.add_argument('--config', default='config.yml', help='Config file path')
-    parser.add_argument('--ui-only', action='store_true',
-                        help='Start web UI only (no camera/detection)')
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
-    init_storage(cfg)
-
-    if args.ui_only:
-        run_ui_only(cfg)
-        return
-
-    stream_url = args.url or cfg.camera.url or os.environ.get('CAMERA_URL', '')
-    if cfg.camera.test_input:
-        stream_url = cfg.camera.test_input
-    elif not stream_url:
-        print("Usage: python scripts/surveillance.py <camera_url>")
-        print("  Or set CAMERA_URL in .env or config.yml")
-        sys.exit(1)
-
-    # Check camera before loading models
-    print(f"Connecting to camera...")
-    cap = CameraStream(stream_url)
-    if not cap.isOpened():
-        print("Camera unavailable, falling back to UI-only mode...")
-        cap.release()
-        run_ui_only(cfg)
-        return
-    time.sleep(1)
-
-    ret, test_frame = cap.read()
-    if not ret or test_frame is None:
-        print("Camera not responding, falling back to UI-only mode...")
-        cap.release()
-        run_ui_only(cfg)
-        return
-    print("Camera connected")
-
-    no_display = not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
-    class_filter = CLASS_PRESETS_V2[cfg.detection.mode]
-
-    print("Loading model...")
-    detector = MultiModelDetector(
-        [ModelConfig(cfg.detection.model, class_conf=cfg.detection.class_conf)],
-        device='auto', imgsz=cfg.detection.imgsz
-    )
-    tracker = Tracker(
-        max_age=cfg.tracker.max_age, min_hits=cfg.tracker.min_hits,
-        iou_threshold=cfg.tracker.iou_threshold, max_coast=cfg.tracker.max_coast,
-    )
-    motion = MotionDetector(min_area=cfg.motion.min_area)
-    recording_mgr = RecordingManager(cfg.recording, rtsp_url=stream_url)
-    recording_mgr.start()
-    zone_filter = ZoneFilter(cfg.storage.zones)
-    print(f"Model loaded ({detector.device})")
-
-    clean_status = "enabled" if recording_mgr.clean and recording_mgr.clean.available else "disabled"
-    annotated_status = "enabled" if recording_mgr.annotated else "disabled"
-    print(f"  Clean recording: {clean_status}")
-    print(f"  Annotated recording: {annotated_status}")
-
-    api_state = PipelineState(
-        recording_mgr=recording_mgr,
-        zone_filter=zone_filter,
-        config=cfg,
-        crops_dir=CAPTURES_DIR,
-        training_dir=Path(cfg.storage.training),
-    )
-
-    if cfg.display.web:
-        start_api_server(api_state, cfg.display.web_port)
-        print(f"\n  Web UI: http://localhost:{cfg.display.web_port}")
-        open_browser(f'http://localhost:{cfg.display.web_port}')
-
-    print(f"\nSurveillance settings:")
-    print(f"  Mode: {cfg.detection.mode} | Confidence: {cfg.detection.confidence}")
-    print(f"  Detection FPS: {cfg.detection.detect_fps} | Loop FPS: {cfg.display.max_fps}")
-    print(f"  Recording cooldown: {cfg.recording.annotated.cooldown}s")
-    print(f"  Outputs: {cfg.recording.output_dir}/")
-    print(f"\n{'Controls: q quit | r reset' if not no_display else 'Press Ctrl+C to stop'}")
-
-    track_info = {}
-    track_last_capture = {}
-    frame_times = []
-    last_uncertain_save = 0
-    uncertain_count = 0
-    event_count = 0
-    capture_count = 0
-    class_counts = {}
-    classes_seen = {}
-    frame_count = 0
-    prev_recorder_state = recording_mgr.state
-    min_frame_time = 1.0 / cfg.display.max_fps
-    last_loop_time = time.time()
-    detect_interval = 1.0 / cfg.detection.detect_fps
-    last_detect_time = 0
-    det_array = np.empty((0, 6))
-    detections = []
-    merged_full = []
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                continue
-
-            start = time.time()
-            frame_count += 1
-            full_h, full_w = frame.shape[:2]
-
-            # Motion detection on downscaled frame
-            proc_w = 640
-            scale = proc_w / full_w
-            proc_frame = cv2.resize(frame, (proc_w, int(full_h * scale)))
-
-            motion_regions = motion.detect(proc_frame)
-            merged = merge_overlapping_regions(motion_regions, padding=30)
-            has_motion = len(merged) > 0
-
-            inv_scale = full_w / proc_w
-            merged_full = [
-                (int(x1 * inv_scale), int(y1 * inv_scale),
-                 int(x2 * inv_scale), int(y2 * inv_scale))
-                for x1, y1, x2, y2 in merged
-            ]
-
-            # Exclude zones act as motion masks — drop motion in masked areas
-            if zone_filter:
-                merged_full = zone_filter.filter_motion_regions(
-                    merged_full, (full_h, full_w)
-                )
-            has_motion = len(merged_full) > 0
-
-            # Object detection (only on unmasked motion, capped at detect_fps)
-            now = time.time()
-            ran_detection = False
-            if has_motion and (now - last_detect_time >= detect_interval):
-                det_array = detector.detect_array(
-                    frame, conf_threshold=cfg.detection.confidence, classes=class_filter
-                )
-                detections = [
-                    {'box': det[:4].tolist(), 'confidence': float(det[4]),
-                     'class_id': int(det[5]),
-                     'class_name': detector.class_names.get(int(det[5]), 'unknown')}
-                    for det in det_array
-                ]
-                last_detect_time = now
-                ran_detection = True
-
-                # Exclude zones — drop detections in masked areas
-                if zone_filter and detections:
-                    detections = zone_filter.filter_detections(detections, frame.shape)
-                    det_array = np.array([
-                        [*d['box'], d['confidence'], d['class_id']]
-                        for d in detections
-                    ]) if detections else np.empty((0, 6))
-
-            # Tracking
-            tracks = tracker.update(det_array if ran_detection else np.empty((0, 6)))
-
-            if ran_detection:
-                for t in tracker.tracks:
-                    if t.time_since_update == 0 and len(detections) > 0:
-                        track_box = t.get_state().flatten()
-                        best_iou, best_det = 0, None
-                        for det in detections:
-                            iou = _box_iou(track_box, det['box'])
-                            if iou > best_iou:
-                                best_iou, best_det = iou, det
-                        if best_det and best_iou > 0.3:
-                            track_info[t.id] = {
-                                'class_id': best_det['class_id'],
-                                'class_name': best_det['class_name'],
-                                'confidence': best_det['confidence'],
-                                'box': best_det['box'],
-                            }
-
-            # Build annotated frame, then record
-            has_objects = len(tracks) > 0
-            in_required_zone = (
-                not zone_filter
-                or zone_filter.check_required_zones(detections, frame.shape)
-            ) if ran_detection else False
-            display = frame.copy()
-            for bx1, by1, bx2, by2 in merged_full:
-                cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 0, 255), 1)
-            display = draw_tracks(display, tracks, track_info, detector.class_names)
-
-            triggered = has_motion and has_objects and in_required_zone
-            sustain = has_motion and recording_mgr.is_recording and has_objects
-            recording_mgr.update(frame, display, triggered or sustain, detections)
-
-            if recording_mgr.state != prev_recorder_state:
-                ts = datetime.now().strftime('%H:%M:%S')
-                if recording_mgr.state.value == 'recording':
-                    event_count += 1
-                    print(f"  [{ts}] Recording started (event #{event_count})")
-                elif recording_mgr.state.value == 'cooldown':
-                    print(f"  [{ts}] Motion stopped, cooldown...")
-                elif recording_mgr.state.value == 'idle':
-                    print(f"  [{ts}] Recording saved")
-                prev_recorder_state = recording_mgr.state
-
-            # Capture crops for moving objects only
-            now = time.time()
-            frame_captures = []
-            for row in tracks:
-                x1, y1, x2, y2, track_id = row
-                track_id = int(track_id)
-                info = track_info.get(track_id)
-                if info is None:
-                    continue
-                if not _overlaps_motion(info['box'], merged_full):
-                    continue
-                if now - track_last_capture.get(track_id, 0) < cfg.capture.interval:
-                    continue
-                if save_crop(frame, info['box'], track_id, info['class_name'], info['confidence']):
-                    track_last_capture[track_id] = now
-                    capture_count += 1
-                    class_counts[info['class_name']] = class_counts.get(info['class_name'], 0) + 1
-                    classes_seen[info['class_id']] = info['class_name']
-                    frame_captures.append(info)
-
-            if frame_captures:
-                save_frame_with_labels(frame, frame_captures)
-                names = [c['class_name'] for c in frame_captures]
-                print(f"  [{datetime.now().strftime('%H:%M:%S')}] "
-                      f"Captured {len(frame_captures)}: {', '.join(names)}")
-
-            # Uncertain detection capture
-            if now - last_uncertain_save >= cfg.capture.uncertain_interval:
-                uncertain = [
-                    d for d in detections
-                    if cfg.capture.uncertain_low <= d['confidence'] <= cfg.capture.uncertain_high
-                ]
-                if uncertain:
-                    save_uncertain(frame, uncertain, datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
-                    uncertain_count += 1
-                    last_uncertain_save = now
-
-            # Display / Web stream
-            if not no_display or cfg.display.web:
-                now_t = time.time()
-                frame_times.append(now_t - last_loop_time)
-                last_loop_time = now_t
-                if len(frame_times) > 30:
-                    frame_times.pop(0)
-                fps = len(frame_times) / sum(frame_times)
-
-                rec_color = {'idle': (200, 200, 200), 'recording': (0, 0, 255),
-                             'cooldown': (0, 165, 255)}[recording_mgr.state.value]
-                cv2.putText(display, f"FPS: {fps:.1f} | {recording_mgr.state.value.upper()}",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, rec_color, 2)
-                cv2.putText(display,
-                            f"Tracks: {len(tracks)} | Captures: {capture_count} | Events: {event_count}",
-                            (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                if recording_mgr.is_recording:
-                    cv2.circle(display, (display.shape[1] - 30, 30), 12, (0, 0, 255), -1)
-
-                if cfg.display.web:
-                    ws = 1920 / display.shape[1]
-                    web_frame = cv2.resize(display, (1920, int(display.shape[0] * ws)))
-                    with api_state.frame_lock:
-                        api_state.frame = web_frame
-                    api_state.fps = fps
-                    api_state.frame_count = frame_count
-                    api_state.event_count = event_count
-
-                if not no_display:
-                    cv2.imshow("VisionBox Surveillance", display)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord('r'):
-                        tracker.reset()
-                        motion.reset()
-                        track_info.clear()
-                        track_last_capture.clear()
-                        print("Reset")
-
-            elapsed = time.time() - start
-            if elapsed < min_frame_time:
-                time.sleep(min_frame_time - elapsed)
-
-            if frame_count % 500 == 0:
-                active_ids = {t.id for t in tracker.tracks}
-                for sid in set(track_info) - active_ids:
-                    track_info.pop(sid, None)
-                    track_last_capture.pop(sid, None)
-
-    except KeyboardInterrupt:
-        print("\nStopping...")
-    finally:
-        recording_mgr.stop()
-        cap.release()
-        cv2.destroyAllWindows()
-        if classes_seen:
-            with open(DATASET_DIR / 'classes.txt', 'w') as f:
-                for cid in sorted(classes_seen):
-                    f.write(f"{cid}: {classes_seen[cid]}\n")
-
-        print(f"\n{'='*50}")
-        print(f"Session summary:")
-        print(f"  Frames: {frame_count} | Events: {event_count} | Captures: {capture_count}")
-        if class_counts:
-            for name, count in sorted(class_counts.items(), key=lambda x: -x[1]):
-                print(f"    {name}: {count}")
-        print(f"  Uncertain: {uncertain_count}")
-        print(f"  Outputs: {cfg.recording.output_dir}/")
 
 
 def _box_iou(a, b):
@@ -537,6 +142,555 @@ def _overlaps_motion(det_box, motion_boxes):
         if dx1 < mx2 and dx2 > mx1 and dy1 < my2 and dy2 > my1:
             return True
     return False
+
+
+class CameraPipeline:
+    """Per-camera worker: capture → motion → detect → track → record."""
+
+    def __init__(
+        self,
+        cam_cfg: CameraConfig,
+        global_cfg: VisionBoxConfig,
+        detector: MultiModelDetector,
+        detector_lock: threading.Lock,
+        db: RecordingDatabase,
+    ):
+        self.name = cam_cfg.name
+        self.url = cam_cfg.url
+        self.detect_url = cam_cfg.detect_url or cam_cfg.url
+        self.test_input = cam_cfg.test_input
+        self.cfg = global_cfg
+        self.detector = detector
+        self.detector_lock = detector_lock
+        self.db = db
+
+        self.recordings_dir = global_cfg.camera_recordings_dir(self.name)
+        self.crops_dir = global_cfg.camera_crops_dir(self.name)
+        self.dataset_dir = global_cfg.camera_dataset_dir(self.name)
+        self.review_dir = global_cfg.camera_review_dir(self.name)
+        zones_path = global_cfg.camera_zones_path(self.name)
+
+        for d in [
+            self.recordings_dir, self.crops_dir, self.review_dir,
+            self.dataset_dir / 'images', self.dataset_dir / 'labels',
+            zones_path.parent,
+        ]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        self.zone_filter = ZoneFilter(str(zones_path))
+        self.motion = MotionDetector(min_area=global_cfg.motion.min_area)
+        self.tracker = Tracker(
+            max_age=global_cfg.tracker.max_age,
+            min_hits=global_cfg.tracker.min_hits,
+            iou_threshold=global_cfg.tracker.iou_threshold,
+            max_coast=global_cfg.tracker.max_coast,
+        )
+        self.recording_mgr = RecordingManager(
+            global_cfg.recording,
+            rtsp_url=self.url,
+            camera=self.name,
+            output_dir=self.recordings_dir,
+            db=db,
+        )
+
+        self.view = CameraView(name=self.name)
+
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+        self._track_info: dict[int, dict] = {}
+        self._track_last_capture: dict[int, float] = {}
+        self._track_positions: dict[int, deque] = {}
+        self._track_scores: dict[int, deque] = {}
+        self._capture_count = 0
+        self._event_count = 0
+        self._class_counts: dict[str, int] = {}
+        self._classes_seen: dict[int, str] = {}
+        self._last_uncertain_save = 0.0
+        self._frame_count = 0
+
+    def start(self):
+        self.recording_mgr.start()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f'cam-{self.name}',
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        self.recording_mgr.stop()
+        if self._classes_seen:
+            with open(self.dataset_dir / 'classes.txt', 'w') as f:
+                for cid in sorted(self._classes_seen):
+                    f.write(f"{cid}: {self._classes_seen[cid]}\n")
+
+    def _run(self):
+        """Top-level loop: handles reconnects."""
+        backoff = 2
+        while not self._stop.is_set():
+            try:
+                if self._connect_and_process():
+                    backoff = 2
+            except Exception as exc:
+                self.view.connected = False
+                self.view.last_error = f'{type(exc).__name__}: {exc}'
+                print(f"[{self.name}] error: {self.view.last_error}", flush=True)
+            if self._stop.is_set():
+                break
+            for _ in range(int(backoff * 10)):
+                if self._stop.is_set():
+                    return
+                time.sleep(0.1)
+            backoff = min(backoff * 2, 30)
+
+    def _connect_and_process(self) -> bool:
+        stream_url = self.test_input or self.detect_url
+        print(f"[{self.name}] connecting to {_redact_url(stream_url)}", flush=True)
+        cap = CameraStream(stream_url)
+        if not cap.isOpened():
+            self.view.connected = False
+            self.view.last_error = 'open failed'
+            cap.release()
+            return False
+        time.sleep(1)
+        ret, test_frame = cap.read()
+        if not ret or test_frame is None:
+            self.view.connected = False
+            self.view.last_error = 'no frames'
+            cap.release()
+            return False
+        self.view.connected = True
+        self.view.last_error = ''
+        print(f"[{self.name}] connected ({test_frame.shape[1]}x{test_frame.shape[0]})", flush=True)
+        try:
+            self._main_loop(cap)
+        finally:
+            cap.release()
+        return True
+
+    def _main_loop(self, cap: CameraStream):
+        cfg = self.cfg
+        class_filter = CLASS_PRESETS_V2[cfg.detection.mode]
+
+        prev_event_id = self.recording_mgr.event_id
+        min_frame_time = 1.0 / cfg.display.max_fps
+        last_loop_time = time.time()
+        detect_interval = 1.0 / cfg.detection.detect_fps
+        last_detect_time = 0.0
+        det_array = np.empty((0, 6))
+        detections: list[dict] = []
+        merged_full: list[tuple] = []
+        frame_times: list[float] = []
+
+        consecutive_failures = 0
+
+        while not self._stop.is_set():
+            if time.time() - cap.last_frame_time > 10:
+                self.view.connected = False
+                self.view.last_error = 'stream stalled'
+                print(f"[{self.name}] stream stalled, reconnecting", flush=True)
+                return
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                consecutive_failures += 1
+                if consecutive_failures > 100:  # ~10s of no frames
+                    self.view.connected = False
+                    self.view.last_error = 'lost stream'
+                    print(f"[{self.name}] lost stream, reconnecting", flush=True)
+                    return
+                time.sleep(0.1)
+                continue
+            consecutive_failures = 0
+
+            start = time.time()
+            self._frame_count += 1
+            full_h, full_w = frame.shape[:2]
+
+            # Motion on downscaled frame
+            proc_w = 640
+            scale = proc_w / full_w
+            proc_frame = cv2.resize(frame, (proc_w, int(full_h * scale)))
+            motion_regions = self.motion.detect(proc_frame)
+            merged = merge_overlapping_regions(motion_regions, padding=30)
+
+            inv_scale = full_w / proc_w
+            merged_full = [
+                (int(x1 * inv_scale), int(y1 * inv_scale),
+                 int(x2 * inv_scale), int(y2 * inv_scale))
+                for x1, y1, x2, y2 in merged
+            ]
+            if self.zone_filter:
+                merged_full = self.zone_filter.filter_motion_regions(
+                    merged_full, (full_h, full_w)
+                )
+            has_motion = len(merged_full) > 0
+
+            # Detection (motion-gated, FPS-capped, shared detector)
+            now = time.time()
+            ran_detection = False
+            if has_motion and (now - last_detect_time >= detect_interval):
+                with self.detector_lock:
+                    det_array = self.detector.detect_array(
+                        frame, conf_threshold=cfg.detection.confidence,
+                        classes=class_filter,
+                    )
+                detections = [
+                    {'box': det[:4].tolist(), 'confidence': float(det[4]),
+                     'class_id': int(det[5]),
+                     'class_name': self.detector.class_names.get(int(det[5]), 'unknown')}
+                    for det in det_array
+                ]
+                last_detect_time = now
+                ran_detection = True
+                if self.zone_filter and detections:
+                    detections = self.zone_filter.filter_detections(detections, frame.shape)
+                    det_array = np.array([
+                        [*d['box'], d['confidence'], d['class_id']]
+                        for d in detections
+                    ]) if detections else np.empty((0, 6))
+
+            tracks = self.tracker.update(det_array if ran_detection else np.empty((0, 6)))
+
+            # Maintain per-track position history for the stationary filter
+            now_pos = time.time()
+            for row in tracks:
+                tid = int(row[4])
+                cx = (row[0] + row[2]) * 0.5
+                cy = (row[1] + row[3]) * 0.5
+                hist = self._track_positions.setdefault(tid, deque(maxlen=240))
+                hist.append((cx, cy, now_pos))
+
+            moving_track_ids = {int(t[4]) for t in tracks if self._is_track_moving(int(t[4]))}
+
+            if ran_detection:
+                for t in self.tracker.tracks:
+                    if t.time_since_update == 0 and detections:
+                        track_box = t.get_state().flatten()
+                        best_iou, best_det = 0, None
+                        for det in detections:
+                            iou = _box_iou(track_box, det['box'])
+                            if iou > best_iou:
+                                best_iou, best_det = iou, det
+                        if best_det and best_iou > 0.3:
+                            self._track_info[t.id] = {
+                                'class_id': best_det['class_id'],
+                                'class_name': best_det['class_name'],
+                                'confidence': best_det['confidence'],
+                                'box': best_det['box'],
+                            }
+                            self._track_scores.setdefault(
+                                t.id, deque(maxlen=cfg.detection.confirm_window)
+                            ).append(best_det['confidence'])
+
+            confirmed_ids = {tid for tid in moving_track_ids if self._is_track_confirmed(tid)}
+            has_moving_objects = len(confirmed_ids) > 0
+            in_required_zone = (
+                not self.zone_filter
+                or self.zone_filter.check_required_zones(detections, frame.shape)
+            ) if ran_detection else False
+
+            display = frame.copy()
+            for bx1, by1, bx2, by2 in merged_full:
+                cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 0, 255), 1)
+            display = draw_tracks(display, tracks, self._track_info, self.detector.class_names)
+
+            triggered = has_motion and has_moving_objects and in_required_zone
+            sustain = has_motion and self.recording_mgr.is_recording and has_moving_objects
+            self.recording_mgr.update(frame, display, triggered or sustain, detections)
+
+            current_event_id = self.recording_mgr.event_id
+            if current_event_id != prev_event_id:
+                ts = datetime.now().strftime('%H:%M:%S')
+                if current_event_id and not prev_event_id:
+                    self._event_count += 1
+                    print(f"[{self.name}] [{ts}] recording (event #{self._event_count})", flush=True)
+                elif prev_event_id and not current_event_id:
+                    print(f"[{self.name}] [{ts}] saved", flush=True)
+                prev_event_id = current_event_id
+
+            # Capture crops for moving tracked objects (skip stationary)
+            now = time.time()
+            frame_captures = []
+            for row in tracks:
+                x1, y1, x2, y2, track_id = row
+                track_id = int(track_id)
+                info = self._track_info.get(track_id)
+                if info is None:
+                    continue
+                if track_id not in confirmed_ids:
+                    continue
+                if not _overlaps_motion(info['box'], merged_full):
+                    continue
+                if now - self._track_last_capture.get(track_id, 0) < cfg.capture.interval:
+                    continue
+                if self._save_crop(frame, info['box'], track_id,
+                                   info['class_name'], info['confidence']):
+                    self._track_last_capture[track_id] = now
+                    self._capture_count += 1
+                    self._class_counts[info['class_name']] = (
+                        self._class_counts.get(info['class_name'], 0) + 1
+                    )
+                    self._classes_seen[info['class_id']] = info['class_name']
+                    frame_captures.append(info)
+
+            if frame_captures:
+                self._save_frame_with_labels(frame, frame_captures)
+
+            # Uncertain detection capture
+            if now - self._last_uncertain_save >= cfg.capture.uncertain_interval:
+                uncertain = [
+                    d for d in detections
+                    if cfg.capture.uncertain_low <= d['confidence'] <= cfg.capture.uncertain_high
+                ]
+                if uncertain:
+                    self._save_uncertain(frame, uncertain,
+                                         datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+                    self._last_uncertain_save = now
+
+            # Update web view (annotated frame, capped width to keep MJPEG light)
+            now_t = time.time()
+            frame_times.append(now_t - last_loop_time)
+            last_loop_time = now_t
+            if len(frame_times) > 30:
+                frame_times.pop(0)
+            fps = len(frame_times) / sum(frame_times) if frame_times else 0
+
+            rec_color = {'idle': (200, 200, 200), 'recording': (0, 0, 255),
+                         'cooldown': (0, 165, 255)}[self.recording_mgr.state.value]
+            cv2.putText(display, f"{self.name}  {fps:.1f}FPS",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, rec_color, 2)
+            if self.recording_mgr.is_recording:
+                cv2.circle(display, (display.shape[1] - 30, 30), 12, (0, 0, 255), -1)
+
+            target_w = 1920
+            if display.shape[1] > target_w:
+                ws = target_w / display.shape[1]
+                web_frame = cv2.resize(
+                    display, (target_w, int(display.shape[0] * ws)),
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                web_frame = display
+            with self.view.frame_lock:
+                self.view.frame = web_frame
+            self.view.fps = round(fps, 1)
+            self.view.frame_count = self._frame_count
+            self.view.event_count = self._event_count
+            self.view.recording = self.recording_mgr.is_recording
+            self.view.state = self.recording_mgr.state.value
+            self.view.last_update = now_t
+
+            # Periodic track-info cleanup
+            if self._frame_count % 500 == 0:
+                active_ids = {t.id for t in self.tracker.tracks}
+                for sid in set(self._track_info) - active_ids:
+                    self._track_info.pop(sid, None)
+                    self._track_last_capture.pop(sid, None)
+                    self._track_positions.pop(sid, None)
+                    self._track_scores.pop(sid, None)
+
+            elapsed = time.time() - start
+            if elapsed < min_frame_time:
+                time.sleep(min_frame_time - elapsed)
+
+    def _is_track_moving(self, tid: int) -> bool:
+        """True if the track moved at least min_displacement px within stationary_window seconds."""
+        hist = self._track_positions.get(tid)
+        if not hist or len(hist) < 2:
+            return True  # too new — treat as moving so first-seen objects aren't ignored
+        window = self.cfg.tracker.stationary_window
+        min_disp = self.cfg.tracker.stationary_min_displacement
+        now = hist[-1][2]
+        oldest = None
+        for entry in hist:
+            if now - entry[2] <= window:
+                oldest = entry
+                break
+        if oldest is None:
+            return True
+        # Need at least half the window of history before we call it stationary
+        if now - oldest[2] < window * 0.5:
+            return True
+        dx = hist[-1][0] - oldest[0]
+        dy = hist[-1][1] - oldest[1]
+        return math.hypot(dx, dy) >= min_disp
+
+    def _is_track_confirmed(self, tid: int) -> bool:
+        """True once a track has at least confirm_min_count detections whose median
+        score crosses the threshold — kills single-frame flicker without penalising
+        short or mid-confidence tracks (Frigate-style)."""
+        scores = self._track_scores.get(tid)
+        if not scores or len(scores) < self.cfg.detection.confirm_min_count:
+            return False
+        threshold = self.cfg.detection.confirm_threshold
+        info = self._track_info.get(tid)
+        if info:
+            threshold = self.cfg.detection.confirm_threshold_by_class.get(
+                info['class_id'], threshold)
+        return statistics.median(scores) >= threshold
+
+    def _save_crop(self, frame, box, track_id, class_name, confidence, padding=20):
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in box]
+        cx1, cy1 = max(0, x1 - padding), max(0, y1 - padding)
+        cx2, cy2 = min(w, x2 + padding), min(h, y2 + padding)
+        crop = frame[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            return False
+        class_dir = self.crops_dir / class_name.replace(' ', '_')
+        class_dir.mkdir(exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        cv2.imwrite(str(class_dir / f"track{track_id}_{ts}_{confidence:.2f}.jpg"), crop)
+        return True
+
+    def _save_frame_with_labels(self, frame, capture_detections):
+        h, w = frame.shape[:2]
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        cv2.imwrite(str(self.dataset_dir / 'images' / f"{ts}.jpg"), frame)
+        with open(self.dataset_dir / 'labels' / f"{ts}.txt", 'w') as f:
+            for det in capture_detections:
+                x1, y1, x2, y2 = det['box']
+                cx, cy = ((x1 + x2) / 2) / w, ((y1 + y2) / 2) / h
+                bw, bh = (x2 - x1) / w, (y2 - y1) / h
+                f.write(f"{det['class_id']} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+
+    def _save_uncertain(self, frame, detections, timestamp_str):
+        img_path = self.review_dir / f"{timestamp_str}.jpg"
+        cv2.imwrite(str(img_path), frame)
+        meta = {
+            'timestamp': timestamp_str,
+            'camera': self.name,
+            'source': 'surveillance_auto',
+            'detections': [
+                {'class': d['class_name'], 'class_id': d['class_id'],
+                 'confidence': round(d['confidence'], 3),
+                 'box': [int(x) for x in d['box']]}
+                for d in detections
+            ],
+        }
+        with open(self.review_dir / f"{timestamp_str}.json", 'w') as f:
+            json.dump(meta, f, indent=2)
+        h, w = frame.shape[:2]
+        with open(self.review_dir / f"{timestamp_str}.txt", 'w') as f:
+            for d in detections:
+                x1, y1, x2, y2 = d['box']
+                cx, cy = ((x1 + x2) / 2) / w, ((y1 + y2) / 2) / h
+                bw, bh = (x2 - x1) / w, (y2 - y1) / h
+                f.write(f"{d['class_id']} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+
+
+def init_global_storage(cfg: VisionBoxConfig):
+    """Ensure shared roots exist (the per-camera subdirs are created later)."""
+    for d in [
+        Path(cfg.recording.output_dir),
+        Path(cfg.storage.crops),
+        Path(cfg.storage.dataset),
+        Path(cfg.storage.review),
+        Path(cfg.storage.training),
+        Path(cfg.storage.zones_dir),
+    ]:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='VisionBox multi-camera surveillance')
+    parser.add_argument('--config', default='config.yml', help='Config file path')
+    parser.add_argument('--ui-only', action='store_true',
+                        help='Start web UI only (no cameras, browse past events)')
+    parser.add_argument('--no-browser', action='store_true',
+                        help='Do not auto-open the browser')
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    init_global_storage(cfg)
+
+    output_dir = Path(cfg.recording.output_dir)
+    db = RecordingDatabase(output_dir / 'visionbox.db')
+
+    cameras = cfg.enabled_cameras()
+
+    state = CamerasState(
+        config=cfg,
+        db=db,
+        output_dir=output_dir,
+        crops_dir=Path(cfg.storage.crops),
+        training_dir=Path(cfg.storage.training),
+        zones_dir=Path(cfg.storage.zones_dir),
+    )
+
+    if args.ui_only or not cameras:
+        if not cameras:
+            print("No cameras configured; running UI-only.")
+        state.offline = True
+        port = cfg.display.web_port
+        start_api_server(state, port, cfg.display.bind_host)
+        print(f"VisionBox UI-only at http://0.0.0.0:{port}")
+        if not args.no_browser:
+            open_browser(f'http://localhost:{port}')
+        stop = threading.Event()
+        signal.signal(signal.SIGINT, lambda s, f: stop.set())
+        signal.signal(signal.SIGTERM, lambda s, f: stop.set())
+        stop.wait()
+        db.close()
+        return
+
+    print(f"Loading model ({cfg.detection.model})...")
+    detector = MultiModelDetector(
+        [ModelConfig(cfg.detection.model, class_conf=cfg.detection.class_conf)],
+        device=cfg.detection.device, imgsz=cfg.detection.imgsz,
+    )
+    detector_lock = threading.Lock()
+    state.detector = detector
+    state.detector_lock = detector_lock
+    print(f"Model loaded ({detector.effective_device})")
+
+    pipelines = []
+    for name, cam_cfg in cameras.items():
+        pipeline = CameraPipeline(cam_cfg, cfg, detector, detector_lock, db)
+        pipelines.append(pipeline)
+        state.add_camera(pipeline.view, pipeline.zone_filter, pipeline.recording_mgr)
+
+    port = cfg.display.web_port
+    start_api_server(state, port, cfg.display.bind_host)
+    print(f"\nVisionBox running")
+    print(f"  Cameras: {', '.join(p.name for p in pipelines)}")
+    print(f"  Storage: {output_dir}")
+    print(f"  Web UI:  http://0.0.0.0:{port}")
+    print(f"  Press Ctrl+C to stop\n")
+
+    for p in pipelines:
+        p.start()
+
+    if not args.no_browser:
+        open_browser(f'http://localhost:{port}')
+
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda s, f: stop.set())
+    signal.signal(signal.SIGTERM, lambda s, f: stop.set())
+
+    def _reload_model(signum, frame):
+        # SIGHUP -> hot-swap a freshly-promoted model. reload() builds + warms the new
+        # model unlocked and takes detector_lock only for the sub-ms pointer swap, so
+        # the cameras are never blind for more than a frame.
+        def _do():
+            try:
+                detector.reload(swap_lock=detector_lock)
+                print("[reload] model reloaded via SIGHUP", flush=True)
+            except Exception as exc:
+                print(f"[reload] failed: {type(exc).__name__}: {exc}", flush=True)
+        threading.Thread(target=_do, daemon=True, name='model-reload').start()
+    signal.signal(signal.SIGHUP, _reload_model)
+
+    try:
+        stop.wait()
+    finally:
+        print("\nShutting down...")
+        for p in pipelines:
+            p.stop()
+        db.close()
+        print("Done.")
 
 
 if __name__ == "__main__":
