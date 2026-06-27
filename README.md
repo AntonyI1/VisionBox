@@ -1,19 +1,26 @@
 # VisionBox
 
-Self-hosted AI video surveillance system with motion-first detection, object tracking, dual recording, and a web dashboard.
+Self-hosted, multi-camera AI video surveillance. Motion-first detection, persistent object tracking,
+dual recording (clean RTSP copy + annotated mp4), and a single web dashboard for live tiles, events,
+detection zones, and the active-learning review queue.
 
 ## Features
 
-- **Motion-first detection** — background subtraction identifies movement, YOLO runs only where motion occurs. Keeps GPU/CPU idle when nothing is happening.
-- **Object tracking** — Kalman filter + Hungarian algorithm (SORT) maintains persistent IDs across frames, survives brief occlusions.
-- **Dual recording** — clean FFmpeg stream (original quality) + annotated OpenCV stream (bounding boxes, labels) saved simultaneously.
-- **Web dashboard** — live view, event browser, detection zone editor, crop review, and training data management.
-- **Detection zones** — draw include/exclude polygons on the live view to control where detections trigger.
-- **Active learning pipeline** — auto-captures detection crops for human review, approved crops move to training set.
-- **YAML configuration** — all settings in `config.yml` with environment variable substitution.
-- **SQLite event database** — every recording event logged with metadata, searchable from the dashboard.
-- **Retention management** — automatic cleanup by age, storage budget, and per-label limits.
-- **OpenVINO inference** — optimized for Intel CPUs (~37ms per frame on i5-8600).
+- **Multi-camera, single process** — one worker thread per camera, one shared YOLO detector, one
+  shared SQLite event database. The dashboard shows all cameras in a tile grid; click any tile to
+  fullscreen.
+- **Motion-first detection** — background subtraction identifies movement, YOLO runs only where
+  motion occurs. Keeps the GPU/CPU idle when nothing is happening.
+- **Object tracking** — Kalman filter + Hungarian (SORT) maintains persistent IDs across frames,
+  survives brief occlusions.
+- **Dual recording** — clean FFmpeg stream (original quality, zero re-encode) + annotated OpenCV
+  stream (bounding boxes, labels) saved simultaneously per event.
+- **Per-camera detection zones** — draw include/exclude polygons on a live snapshot.
+- **Active learning pipeline** — auto-captures detection crops per camera; approved crops merge
+  into a global training pool.
+- **YAML configuration** — all settings in `config.yml` with `${VAR}` env substitution.
+- **Retention management** — automatic cleanup by age, storage budget, or per-label limits.
+- **OpenVINO inference** — optimized for Intel CPUs (~37ms per frame on an i5-8600).
 
 ## Quick Start
 
@@ -23,120 +30,118 @@ cd VisionBox
 
 python -m venv venv
 source venv/bin/activate
-
 pip install -r requirements.txt
 
-cp .env.sample .env
-# Edit .env — set CAMERA_URL and STORAGE_DIR
+python scripts/setup_models.py     # downloads + exports yolov8n OpenVINO model
 
+cp .env.sample .env
+# Edit .env — set STORAGE_DIR and any camera credentials referenced in config.yml
+
+# Add your cameras to config.yml (see Configuration below), then:
 python scripts/surveillance.py
 # Dashboard at http://localhost:8085
 ```
 
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `CAMERA_URL` | RTSP URL for your IP camera |
-| `STORAGE_DIR` | Base path for recordings, captures, and training data |
-
-## Web Dashboard
-
-The dashboard runs on port 8085 (configurable) with five tabs:
-
-- **Live** — real-time MJPEG stream with bounding boxes, FPS, and recording status
-- **Events** — browse recorded events with thumbnails, playback clean or annotated clips, delete events
-- **Zones** — draw include/exclude polygons on a camera snapshot to control detection areas
-- **Review** — review auto-captured detection crops, approve to training set or reject
-- **Training** — browse approved training images by class, manage the training dataset
-
-<!-- TODO: screenshots -->
-
-## How It Works
-
-```
-Camera (RTSP) → Motion Detection (MOG2, ~1ms)
-                      ↓ motion regions
-                YOLO Detection (only where motion, capped at detect_fps)
-                      ↓ detections
-                Zone Filtering (exclude/include polygons)
-                      ↓ filtered detections
-                Kalman Tracker (predicts between detections)
-                      ↓ tracks with persistent IDs
-                Recording Manager (clean + annotated streams)
-                      ↓
-                SQLite DB + Web Dashboard
-```
-
-**Why motion-first?** Running YOLO on every frame at full resolution is expensive. Background subtraction costs ~1ms on CPU and eliminates 90%+ of frames. YOLO only runs at `detect_fps` (default 8) and only when motion is detected. The Kalman tracker predicts object positions between detections, so the display stays smooth at 15-30 FPS.
-
-**Why dual recording?** Clean recordings preserve original quality for evidence. Annotated recordings show what the system detected, useful for debugging and review. Both start/stop together with configurable cooldown to avoid clip fragmentation.
-
-## Architecture
-
-```
-src/visionbox/
-├── api.py               # Flask REST API + web server
-├── config.py             # YAML config with env var resolution
-├── database.py           # SQLite event storage
-├── detector_v2.py        # YOLOv8 multi-model detector (OpenVINO/CUDA/CPU)
-├── kalman.py             # Kalman filter for single-box prediction
-├── motion.py             # MOG2 background subtraction
-├── recorder.py           # OpenCV event-triggered video writer
-├── clean_recorder.py     # FFmpeg subprocess for clean RTSP recording
-├── recording_manager.py  # Orchestrates dual recording + retention
-├── tracker.py            # SORT multi-object tracker
-├── zones.py              # Detection zone filtering (include/exclude polygons)
-├── detection.py          # Legacy YOLOv5 detector
-├── preprocessing.py      # Legacy preprocessing
-├── nms.py                # Legacy NMS implementation
-└── web/
-    ├── index.html        # Dashboard SPA
-    ├── app.js            # Dashboard logic (vanilla JS)
-    └── style.css         # Dark theme styles
-
-scripts/
-├── surveillance.py       # Main pipeline (motion → detect → track → record)
-├── camera_demo.py        # Live detection + tracking demo
-├── motion_demo.py        # Motion detection demo
-├── detect_and_capture.py # Standalone capture for training data
-├── capture_for_review.py # Active learning capture
-└── setup_models.py       # Download required models
-```
-
 ## Configuration
 
-All settings live in `config.yml`. Environment variables are resolved via `${VAR_NAME}` syntax.
+`config.yml` defines all cameras and shared defaults. Each camera gets its own RTSP URL and
+optionally per-camera overrides; `${VAR}` placeholders resolve from environment / `.env`.
 
 ```yaml
-camera:
-  url: ${CAMERA_URL}
+cameras:
+  front_door:
+    url: rtsp://admin:${EMPIRETECH_PASS}@192.168.1.50:554/cam/realmonitor?channel=1&subtype=1
+  backyard:
+    url: rtsp://${CAM_USER}:${CAM_PASS}@192.168.1.101:554/stream1
+    enabled: false   # comment-friendly switch
 
 storage:
-  recordings: ${STORAGE_DIR}/recordings
-  crops: ${STORAGE_DIR}/captures/crops
-  training: ${STORAGE_DIR}/datasets/training
+  recordings: ${STORAGE_DIR}/recordings   # per-camera subdir created automatically
+  crops:      ${STORAGE_DIR}/captures/crops
+  zones_dir:  ${STORAGE_DIR}/zones        # per-camera <name>.json files
 
 detection:
-  mode: outdoor          # outdoor, indoor, vehicles, all
+  mode: outdoor       # outdoor | indoor | vehicles | all
   confidence: 0.20
-  detect_fps: 8
+  detect_fps: 5
   model: yolov8n.pt
   imgsz: 640
 
 recording:
   output_dir: ${STORAGE_DIR}/recordings
-  clean:
-    enabled: true
-  annotated:
-    enabled: true
-    cooldown: 10.0
-  retention:
-    days: 30
-    max_storage_gb: 1000
+  clean:     { enabled: true }
+  annotated: { enabled: true, fps: 15.0, cooldown: 10.0 }
+  retention: { days: 30, max_storage_gb: 0, max_per_label: 0, priority_labels: [person] }
 ```
 
-Detection modes filter which COCO classes are active. Per-class confidence thresholds can be set via `class_conf` to reduce false positives for specific classes.
+Per-camera assets land at:
+- `recordings/<camera>/{clean,annotated,thumbnails}/`
+- `captures/crops/<camera>/<class>/`
+- `captures/dataset/<camera>/{images,labels}/`
+- `zones/<camera>.json`
+
+The SQLite event DB is shared at `recordings/visionbox.db` and tags every event with its camera.
+
+## Web Dashboard
+
+`http://<host>:8085` — dark theme, five tabs:
+
+- **Live** — tile grid of every enabled camera; click a tile to focus a full-screen view.
+- **Events** — browse recordings, filter by camera, play clean or annotated clips, delete events.
+- **Zones** — pick a camera, draw include/exclude polygons on its live snapshot.
+- **Review** — pick a camera + class, approve/reject crops with keyboard shortcuts (`A` / `R`).
+- **Training** — browse the approved training pool (global across cameras).
+
+## How It Works
+
+```
+Per camera (worker thread):
+  RTSP → CameraStream (always-latest frame)
+    → MOG2 motion (≈1ms CPU, on downscaled frame)
+    → motion-gated YOLO via shared detector (lock-serialized)
+    → zone filtering (exclude masks, required-zone gate)
+    → SORT tracker (Kalman predict between detections)
+    → RecordingManager → clean RTSP copy + annotated mp4 + SQLite event row + thumbnail
+    → API view buffer for the dashboard MJPEG endpoint
+```
+
+Shared across cameras:
+- One `MultiModelDetector` (OpenVINO/CUDA/CPU auto-detect) behind a lock
+- One `RecordingDatabase` at `<recordings>/visionbox.db`
+- One Flask API server
+
+## Hosting (systemd)
+
+```bash
+sudo install -m 644 visionbox.service /etc/systemd/system/visionbox.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now visionbox.service
+journalctl -u visionbox.service -f
+```
+
+## Architecture
+
+```
+src/visionbox/
+├── api.py               # Flask REST + dashboard, CamerasState + CameraView
+├── config.py            # YAML config with env var resolution, per-camera path helpers
+├── database.py          # SQLite event storage (shared, tagged by camera)
+├── detector_v2.py       # YOLOv8 multi-model detector (OpenVINO/CUDA/CPU)
+├── kalman.py / tracker.py / motion.py / nms.py / preprocessing.py
+├── recorder.py          # OpenCV-driven event recorder (annotated mp4)
+├── clean_recorder.py    # FFmpeg subprocess for zero-CPU RTSP copy
+├── recording_manager.py # Orchestrates dual recording + retention per camera
+├── zones.py             # Per-camera include/exclude polygon filtering
+└── web/                 # Dashboard SPA (index.html, app.js, style.css)
+
+scripts/
+├── surveillance.py      # Main: spawns one CameraPipeline thread per enabled camera
+└── setup_models.py      # Downloads + exports OpenVINO model
+
+config.yml               # The thing you edit
+.env / .env.sample       # Secrets + STORAGE_DIR
+visionbox.service        # systemd unit
+```
 
 ## Tech Stack
 
@@ -144,14 +149,15 @@ Detection modes filter which COCO classes are active. Per-class confidence thres
 - **YOLOv8** (Ultralytics) — object detection
 - **OpenVINO** — inference optimization for Intel CPUs
 - **OpenCV** — video processing, background subtraction, annotated recording
-- **FFmpeg** — clean RTSP stream recording
-- **Flask** — REST API and web dashboard
+- **FFmpeg** — clean RTSP stream copy
+- **Flask** — REST API and dashboard
 - **SQLite** — event database
 - **SciPy** — Hungarian algorithm for tracker assignment
 
 ## Roadmap
 
-- [ ] Faster inference with INT8 precision
-- [ ] Better detection at distance (tiled inference)
-- [ ] One-click model retraining from approved crops
-- [ ] Hardware acceleration with Coral TPU
+- [ ] INT8 quantization
+- [ ] Tiled inference for better distance detection
+- [ ] One-click retraining from approved crops
+- [ ] Coral TPU offload
+- [ ] Per-camera detection presets (currently shared)
