@@ -84,8 +84,8 @@
             populateCamSelect(document.getElementById('zones-cam-select'), false);
             if (zonesCurrentCam) loadZonesView();
         } else if (view === 'review') {
-            populateCamSelect(document.getElementById('review-cam-select'), false, reviewCam);
-            if (reviewCam) loadReviewClasses();
+            populateCamSelect(document.getElementById('review-cam-select'), true, reviewCam);
+            loadReviewClasses();   // '' = all cameras (default)
         } else if (view === 'training') {
             loadTrainingClasses();
         }
@@ -232,8 +232,7 @@
             if (!r) return;
             r.dot.className = 'tile-dot ' + (cam.recording ? 'recording'
                 : cam.connected ? 'connected' : 'offline');
-            r.fps.textContent =
-                cam.connected ? cam.fps.toFixed(1) + ' FPS' : (cam.last_error || 'offline');
+            r.fps.textContent = cam.connected ? '' : (cam.last_error || 'offline');
             r.wrap.classList.toggle('disconnected', !cam.connected);
         });
     }
@@ -258,9 +257,8 @@
         if (!focusedCam) return;
         const cam = cameras.find(c => c.name === focusedCam);
         if (!cam) return;
-        focusStats.textContent =
-            (cam.connected ? cam.fps.toFixed(1) + ' FPS' : 'offline') +
-            (cam.recording ? ' · recording' : '');
+        focusStats.textContent = !cam.connected ? 'offline'
+            : cam.recording ? 'recording' : '';
     }
 
     function closeFocus() {
@@ -647,8 +645,9 @@
     const reviewEmpty = document.getElementById('review-empty');
     const reviewMeta = document.getElementById('review-meta');
     const reviewProgress = document.getElementById('review-progress');
-    let reviewCam = '';
+    let reviewCam = '';        // '' = all cameras
     let reviewClass = '';
+    let reviewCropCam = '';     // camera that owns the crop currently shown
     let reviewOffset = 0;
     let reviewTotal = 0;
 
@@ -657,12 +656,14 @@
         reviewClass = '';
         reviewClassSelect.innerHTML = '<option value="">Select class...</option>';
         clearReview();
-        if (reviewCam) loadReviewClasses();
+        loadReviewClasses();   // works for a specific camera or '' = all
     });
 
     function loadReviewClasses() {
-        if (!reviewCam) return;
-        fetch('/api/cameras/' + encodeURIComponent(reviewCam) + '/review/classes')
+        const url = reviewCam
+            ? '/api/cameras/' + encodeURIComponent(reviewCam) + '/review/classes'
+            : '/api/review/classes';
+        fetch(url)
             .then(r => r.json())
             .then(classes => {
                 reviewClassSelect.innerHTML = '<option value="">Select class...</option>';
@@ -684,10 +685,10 @@
     });
 
     function loadReviewCrop() {
-        if (!reviewClass || !reviewCam) return;
-        const url = '/api/cameras/' + encodeURIComponent(reviewCam) +
-                    '/review/' + encodeURIComponent(reviewClass) +
-                    '?offset=' + reviewOffset;
+        if (!reviewClass) return;
+        const url = (reviewCam
+            ? '/api/cameras/' + encodeURIComponent(reviewCam) + '/review/' + encodeURIComponent(reviewClass)
+            : '/api/review/' + encodeURIComponent(reviewClass)) + '?offset=' + reviewOffset;
         fetch(url)
             .then(r => r.json())
             .then(data => {
@@ -700,7 +701,8 @@
                 }
                 reviewOffset = data.offset;
                 const crop = data.crop;
-                reviewImage.src = '/api/cameras/' + encodeURIComponent(reviewCam) +
+                reviewCropCam = crop.camera || reviewCam;   // owns image/approve/reject
+                reviewImage.src = '/api/cameras/' + encodeURIComponent(reviewCropCam) +
                     '/review/' + encodeURIComponent(reviewClass) +
                     '/' + encodeURIComponent(crop.filename) + '/image';
                 reviewImage.dataset.filename = crop.filename;
@@ -708,6 +710,7 @@
                 reviewEmpty.style.display = 'none';
                 reviewProgress.textContent = (reviewOffset + 1) + ' of ' + reviewTotal;
                 let meta = '';
+                if (!reviewCam && crop.camera) meta += metaRow('Camera', crop.camera);
                 if (crop.track_id != null) meta += metaRow('Track', '#' + crop.track_id);
                 if (crop.confidence != null) meta += metaRow('Confidence', Math.round(crop.confidence * 100) + '%');
                 if (crop.timestamp) meta += metaRow('Time', fmtTime(crop.timestamp));
@@ -719,6 +722,7 @@
         reviewImage.style.display = 'none';
         reviewImage.src = '';
         reviewImage.dataset.filename = '';
+        reviewCropCam = '';
         reviewEmpty.style.display = 'block';
         reviewMeta.innerHTML = '';
         reviewProgress.textContent = '';
@@ -726,8 +730,9 @@
 
     function reviewAction(action) {
         const filename = reviewImage.dataset.filename;
-        if (!filename || !reviewClass || !reviewCam) return;
-        const url = '/api/cameras/' + encodeURIComponent(reviewCam) +
+        const cam = reviewCropCam || reviewCam;
+        if (!filename || !reviewClass || !cam) return;
+        const url = '/api/cameras/' + encodeURIComponent(cam) +
                     '/review/' + encodeURIComponent(reviewClass) +
                     '/' + encodeURIComponent(filename) + '/' + action;
         fetch(url, { method: 'POST' })
@@ -871,6 +876,21 @@
             if (trainingOffset > 0) { trainingOffset--; loadTrainingImage(); }
         }
     });
+
+    // ---------- Service worker (PWA) ----------
+    // Only activates on secure contexts (HTTPS / localhost); register() rejects elsewhere.
+
+    if ('serviceWorker' in navigator) {
+        const hadController = !!navigator.serviceWorker.controller;
+        let reloaded = false;
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+            // An updated worker claimed the page (skipWaiting) — reload once for a fresh shell.
+            if (!hadController || reloaded) return;
+            reloaded = true;
+            location.reload();
+        });
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
 
     // Initial render
     onViewChange('live');
