@@ -185,5 +185,13 @@ class RecordingDatabase:
             )
             self._conn.commit()
 
+    def update_event_clean_clip(self, event_id: str, clean_clip: str):
+        with self._lock:
+            self._conn.execute(
+                'UPDATE events SET clean_clip=? WHERE event_id=?',
+                (clean_clip, event_id)
+            )
+            self._conn.commit()
+
     def close(self):
         self._conn.close()

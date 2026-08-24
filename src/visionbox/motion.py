@@ -26,6 +26,7 @@ class MotionDetector:
         detect_shadows: bool = False,
         min_area: int = 500,
         learning_rate: float = -1,
+        min_area_frac: float = 0.0,
     ):
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=history,
@@ -33,20 +34,39 @@ class MotionDetector:
             detectShadows=detect_shadows,
         )
         self.min_area = min_area
+        self.min_area_frac = min_area_frac
         self.learning_rate = learning_rate
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Set by detect(): full-frame foreground fraction and the min across the 4 quadrants.
+        # Used by the caller's whole-frame illumination guard.
+        self.last_coverage = 0.0
+        self.quadrant_min = 0.0
+
+    def relearn(self, frame: np.ndarray, rate: float = -1):
+        """Fold one frame into the background model without returning regions."""
+        self.bg_subtractor.apply(frame, learningRate=rate)
 
     def detect(self, frame: np.ndarray) -> list[MotionRegion]:
         fg_mask = self.bg_subtractor.apply(frame, learningRate=self.learning_rate)
         fg_mask = cv2.erode(fg_mask, self.kernel, iterations=1)
         fg_mask = cv2.dilate(fg_mask, self.kernel, iterations=2)
 
+        h_m, w_m = fg_mask.shape[:2]
+        self.last_coverage = float(cv2.countNonZero(fg_mask)) / float(h_m * w_m)
+        hh, hw = h_m // 2, w_m // 2
+        quads = [fg_mask[:hh, :hw], fg_mask[:hh, hw:], fg_mask[hh:, :hw], fg_mask[hh:, hw:]]
+        self.quadrant_min = min(cv2.countNonZero(q) / float(max(1, q.size)) for q in quads)
+
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_area = self.min_area
+        if self.min_area_frac > 0:
+            min_area = max(min_area, self.min_area_frac * h_m * w_m)
 
         regions = []
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area >= self.min_area:
+            if area >= min_area:
                 x, y, w, h = cv2.boundingRect(contour)
                 regions.append(MotionRegion(x=x, y=y, w=w, h=h, area=int(area)))
 

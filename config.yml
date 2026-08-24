@@ -41,32 +41,73 @@ detection:
     14: 0.55   # bird
     15: 0.45   # cat
     16: 0.45   # dog
+    17: 0.50   # horse
+    18: 0.50   # sheep
+    19: 0.50   # cow
+    21: 0.50   # bear
+    24: 0.45   # backpack
+    25: 0.45   # umbrella
+    26: 0.50   # handbag
+    28: 0.50   # suitcase
 
   # A track counts as a real object only once the MEDIAN of its detection scores
   # crosses this (Frigate-style) — a one-frame false positive never triggers events.
-  confirm_threshold: 0.45   # median track score to confirm; kept <= class_conf so mid-conf objects aren't dropped
+  confirm_threshold: 0.45   # global median track score to confirm; kept <= class_conf so mid-conf objects aren't dropped
   confirm_window: 10
-  confirm_min_count: 2      # a track needs at least this many detections before it can confirm (kills 1-frame flicker)
+  confirm_min_count: 3      # a track needs >= this many detections before it can confirm (kills IR/1-frame flicker)
+  # Per-class median-confirm overrides (class_id: threshold). Suppresses night/IR phantoms at the
+  # recoverable median gate WITHOUT raising the hard class_conf floor (which would drop faint real objects).
+  confirm_threshold_by_class:
+    0: 0.50    # person  (modest margin over the 0.45 floor)
+    2: 0.40    # car
+    5: 0.45    # bus
+    7: 0.45    # truck
+    14: 0.65   # bird
+    15: 0.55   # cat
+    16: 0.55   # dog
+    17: 0.55   # horse
+    18: 0.55   # sheep
+    19: 0.55   # cow
+    21: 0.55   # bear
+    24: 0.50   # backpack
+    25: 0.50   # umbrella
+    26: 0.55   # handbag
+    28: 0.55   # suitcase
 
 motion:
   min_area: 2000          # ignore tiny shadow/leaf flickers near parked cars
+  merge_padding: 12       # smaller padding so separate leaf flickers don't fuse onto a parked car
+  # Whole-frame illumination guard (IR-cut / auto-exposure / dawn): suppress motion ONLY when the
+  # foreground is near-full-frame AND uniform across all quadrants, and no real object was seen recently.
+  global_change_max_fraction: 0.85
+  global_change_min_quadrant: 0.5
+  recent_real_object_frames: 50
+  # Trigger requires a confirmed+moving object to overlap live motion (kills tree-only / parked-car triggers).
+  require_motion_overlap: true
+  overlap_dilate_px: 40
 
 tracker:
   max_age: 75
   min_hits: 2
   iou_threshold: 0.2
   max_coast: 15
-  stationary_min_displacement: 30    # px — track must move this much to count as moving
+  stationary_min_displacement: 30    # px — absolute floor a track must move to count as moving
   stationary_window: 2.5             # seconds of history to evaluate movement over
+  stationary_min_samples: 4          # measured detections required before judging stationary
+  stationary_disp_box_frac: 0.15     # also require movement >= 15% of the box diagonal (jitter-proof)
+  positions_measured_only: true      # ignore Kalman-coasted positions when measuring movement
 
 recording:
   output_dir: ${STORAGE_DIR}/recordings
   clean:
     enabled: true
+    max_duration: 130.0       # hard -t cap on the RTSP copy
+    min_valid_bytes: 51200    # remove broken (<50KB) clean clips; keep the annotated clip + event row
   annotated:
     enabled: true
     fps: 15.0
     cooldown: 10.0
+    max_duration: 120.0       # force-end runaway events (observed real max ~46s)
   retention:
     days: 30
     max_storage_gb: 0
@@ -84,3 +125,4 @@ display:
   web: true
   web_port: 8085
   max_fps: 15            # main-loop rate (motion + live view); detection is separately gated at detect_fps
+  live_overlays: false   # clean live feeds; flip on to debug motion/track boxes (event clips keep annotations)

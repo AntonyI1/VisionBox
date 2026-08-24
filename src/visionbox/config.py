@@ -43,6 +43,21 @@ class DetectionConfig:
 @dataclass
 class MotionConfig:
     min_area: int = 2000
+    merge_padding: int = 12          # box padding when merging motion contours (full-res px)
+    var_threshold: float = 16.0      # MOG2 sensitivity (exposed for per-camera tuning)
+    history: int = 500
+    detect_shadows: bool = False
+    learning_rate: float = -1        # MOG2 background learning rate (-1 = auto)
+    min_area_frac: float = 0.0       # optional per-camera floor as frac of frame area (0 = off)
+    # Whole-frame illumination guard: if foreground covers >= global_change_max_fraction
+    # AND every quadrant is >= global_change_min_quadrant foreground (uniform change), treat it
+    # as an IR-cut/exposure step, not motion -- unless a real object was seen recently.
+    global_change_max_fraction: float = 0.85
+    global_change_min_quadrant: float = 0.5
+    recent_real_object_frames: int = 50   # skip the guard if a person/car was seen within N frames
+    # Trigger only fires when a confirmed+moving track overlaps live motion (kills tree-only triggers).
+    require_motion_overlap: bool = True
+    overlap_dilate_px: int = 40
 
 
 @dataclass
@@ -56,11 +71,17 @@ class TrackerConfig:
     # trigger recording or get captured for review.
     stationary_min_displacement: float = 30.0
     stationary_window: float = 2.5
+    stationary_min_samples: int = 4          # measured detections needed before judging movement
+    stationary_disp_box_frac: float = 0.15   # also require movement >= this frac of the box diagonal
+    positions_measured_only: bool = True     # only log positions on detection frames (ignore coast)
 
 
 @dataclass
 class CleanRecordingConfig:
     enabled: bool = True
+    max_duration: float = 130.0      # hard -t cap on the RTSP copy (slightly above annotated cap)
+    min_valid_bytes: int = 51200     # clips smaller than this are treated as broken and removed
+    stop_grace: float = 5.0          # seconds to wait for ffmpeg to flush before SIGKILL
 
 
 @dataclass
@@ -68,6 +89,7 @@ class AnnotatedRecordingConfig:
     enabled: bool = True
     fps: float = 15.0
     cooldown: float = 10.0
+    max_duration: float = 120.0      # force-end a runaway event after this many seconds (0 = unbounded)
 
 
 @dataclass
@@ -130,6 +152,7 @@ class DisplayConfig:
     web_port: int = 8085
     bind_host: str = '0.0.0.0'   # set to the tailscale0 IP to keep the UI off the LAN
     max_fps: int = 15
+    live_overlays: bool = False  # draw motion/track boxes on the live feeds (annotated clips always have them)
 
 
 @dataclass

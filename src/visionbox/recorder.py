@@ -48,11 +48,13 @@ class EventRecorder:
         output_dir: str = 'recordings/events',
         cooldown: float = 10.0,
         fps: float = 15.0,
+        max_duration: float = 0.0,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cooldown = cooldown
         self.fps = fps
+        self.max_duration = max_duration
         self._use_ffmpeg = bool(shutil.which('ffmpeg'))
 
         self.state = RecorderState.IDLE
@@ -82,6 +84,12 @@ class EventRecorder:
                 self.state = RecorderState.RECORDING
 
         elif self.state == RecorderState.RECORDING:
+            if self.max_duration > 0 and now - self._start_time >= self.max_duration:
+                # Backstop: force-end a runaway event. If a real subject is still present
+                # the next triggered frame opens a fresh, bounded event.
+                self._stop_recording(now)
+                self.state = RecorderState.IDLE
+                return
             if triggered:
                 self._last_trigger = now
             else:
