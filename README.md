@@ -92,6 +92,27 @@ The SQLite event DB is shared at `recordings/visionbox.db` and tags every event 
 - **Review** — pick a camera + class, approve/reject crops with keyboard shortcuts (`A` / `R`).
 - **Training** — browse the approved training pool (global across cameras).
 
+### Install as an app (PWA)
+
+The dashboard is an installable PWA (web manifest + service worker + offline fallback).
+Installing requires HTTPS; on a tailnet the easiest way is `tailscale serve`, which
+terminates TLS with a valid certificate for the machine's tailnet name:
+
+```bash
+sudo tailscale serve --bg 8085
+# dashboard now at https://<machine>.<tailnet>.ts.net
+```
+
+Then on the phone (Vanadium on GrapheneOS, or any Chromium browser):
+
+1. Open `https://<machine>.<tailnet>.ts.net` and sign in.
+2. Menu (⋮) → **Add to Home screen** → **Install**.
+
+Any reverse proxy that terminates TLS (Caddy, nginx) works too. Over plain
+`http://<tailscale-ip>:8085` the dashboard still works and "Add to Home screen"
+creates a regular shortcut — just without standalone install or the offline page,
+since service workers require a secure context.
+
 ## How It Works
 
 ```
