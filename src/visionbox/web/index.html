@@ -2,8 +2,14 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#221d17">
+    <meta name="mobile-web-app-capable" content="yes">
     <title>VisionBox</title>
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/favicon.ico" sizes="48x48">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png">
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -82,7 +88,7 @@
         <section id="view-review" class="view">
             <div class="review-layout">
                 <div class="review-header">
-                    <select id="review-cam-select"><option value="">Select camera...</option></select>
+                    <select id="review-cam-select"><option value="">All cameras</option></select>
                     <select id="review-class-select">
                         <option value="">Select class...</option>
                     </select>
@@ -91,7 +97,7 @@
                 <div class="review-card">
                     <div class="review-image-wrap">
                         <img id="review-image" decoding="async" alt="">
-                        <div id="review-empty" class="empty-state">Pick a camera and class to start reviewing.</div>
+                        <div id="review-empty" class="empty-state">Pick a class to start reviewing (all cameras by default).</div>
                     </div>
                     <div id="review-meta" class="review-meta"></div>
                 </div>

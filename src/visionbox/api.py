@@ -33,23 +33,31 @@ _LOGIN_PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#221d17">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
 <title>VisionBox · Sign in</title>
 <style>
   * { box-sizing: border-box; }
-  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+  body { margin:0; min-height:100vh; min-height:100dvh; display:flex; align-items:center; justify-content:center;
          font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-         background:radial-gradient(1100px 520px at 50% -8%,#241d15,#15110c); color:#ece3d6; }
+         background:radial-gradient(1100px 520px at 50% -8%,#241d15,#15110c); color:#ece3d6;
+         padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+                  max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
   .card { width:min(92vw,360px); background:#221d17; border:1px solid #3a3229; border-radius:14px;
           padding:32px 30px; box-shadow:0 16px 50px rgba(0,0,0,.55); }
   .brand { margin-bottom:24px; }
   .brand h1 { font-size:19px; margin:0; font-weight:600; color:#ece3d6; }
   .brand small { color:#9d8f7c; font-size:12px; }
   label { display:block; font-size:12px; color:#a2937f; margin:15px 0 6px; font-weight:500; }
-  input { width:100%; padding:11px 12px; background:#1a1510; border:1px solid #3a3229; border-radius:9px;
-          color:#ece3d6; font-size:14px; outline:none; transition:border-color .15s,background .15s; }
+  input { width:100%; min-height:44px; padding:11px 12px; background:#1a1510; border:1px solid #3a3229;
+          border-radius:9px; color:#ece3d6; font-size:14px; outline:none; transition:border-color .15s,background .15s; }
   input:focus { border-color:#cda06d; background:#1f1a13; }
-  button { width:100%; margin-top:24px; padding:12px; background:#cda06d; color:#221a12; border:0;
+  button { width:100%; min-height:44px; margin-top:24px; padding:12px; background:#cda06d; color:#221a12; border:0;
            border-radius:9px; font-size:14px; font-weight:600; cursor:pointer; transition:background .15s; }
   button:hover { background:#dbb184; }
   .err { margin-top:15px; min-height:16px; color:#e0715c; font-size:13px; text-align:center; }
@@ -153,7 +161,10 @@ def create_app(state: CamerasState) -> Flask:
 
         @app.before_request
         def _require_auth():
-            if request.path == '/login' or request.endpoint == 'static':
+            # PWA plumbing stays public: the manifest is fetched without cookies,
+            # and the service worker / favicon carry nothing sensitive.
+            if request.path in ('/login', '/manifest.webmanifest', '/sw.js', '/favicon.ico') \
+                    or request.endpoint == 'static':
                 return None
             if session.get('user'):
                 return None
@@ -174,7 +185,10 @@ def create_app(state: CamerasState) -> Flask:
                     session.permanent = True
                     session['user'] = _auth_user
                     nxt = request.args.get('next', '/')
-                    return redirect(nxt if nxt.startswith('/') else '/')
+                    # Same-site paths only: '//host' and '/\host' are protocol-relative.
+                    if not nxt.startswith('/') or nxt[1:2] in ('/', '\\'):
+                        nxt = '/'
+                    return redirect(nxt)
                 error = 'Incorrect username or password.'
             page = _LOGIN_PAGE.replace('__USER__', _auth_user).replace('__ERROR__', error)
             return Response(page, mimetype='text/html', status=(401 if error else 200))
@@ -209,6 +223,32 @@ def create_app(state: CamerasState) -> Flask:
         return send_file(
             os.path.join(app.static_folder, 'index.html'),
             mimetype='text/html',
+        )
+
+    # ----- PWA (manifest + service worker at root scope) -----
+
+    @app.route('/manifest.webmanifest')
+    def manifest():
+        return send_file(
+            os.path.join(app.static_folder, 'manifest.webmanifest'),
+            mimetype='application/manifest+json',
+        )
+
+    @app.route('/sw.js')
+    def service_worker():
+        # no-cache so browsers revalidate on every load and updates roll out promptly
+        resp = send_file(
+            os.path.join(app.static_folder, 'sw.js'),
+            mimetype='text/javascript',
+        )
+        resp.headers['Cache-Control'] = 'no-cache'
+        return resp
+
+    @app.route('/favicon.ico')
+    def favicon():
+        return send_file(
+            os.path.join(app.static_folder, 'icons', 'favicon.ico'),
+            mimetype='image/vnd.microsoft.icon',
         )
 
     # ----- Cameras -----
@@ -534,6 +574,48 @@ def create_app(state: CamerasState) -> Flask:
         src.unlink()
         logger.info('Rejected %s/%s/%s', name, class_name, filename)
         return jsonify({'action': 'rejected', 'file': filename})
+
+    # ----- Review (all cameras aggregated) -----
+
+    def _all_review_files(class_name: str) -> list[tuple[str, str]]:
+        """Ordered [(camera, filename)] for a class across every camera."""
+        out: list[tuple[str, str]] = []
+        if state.crops_dir.is_dir():
+            for cam_dir in sorted(state.crops_dir.iterdir()):
+                if cam_dir.is_dir():
+                    for fn in _list_images(cam_dir, class_name):
+                        out.append((cam_dir.name, fn))
+        return out
+
+    @app.route('/api/review/classes')
+    def review_classes_all():
+        counts: dict[str, int] = {}
+        if state.crops_dir.is_dir():
+            for cam_dir in sorted(state.crops_dir.iterdir()):
+                if not cam_dir.is_dir():
+                    continue
+                for d in cam_dir.iterdir():
+                    if not d.is_dir():
+                        continue
+                    n = sum(1 for f in d.iterdir()
+                            if f.suffix.lower() in ('.jpg', '.jpeg', '.png'))
+                    if n:
+                        counts[d.name] = counts.get(d.name, 0) + n
+        return jsonify([{'name': k, 'count': counts[k]} for k in sorted(counts)])
+
+    @app.route('/api/review/<class_name>')
+    def review_crop_all(class_name):
+        offset = request.args.get('offset', 0, type=int)
+        files = _all_review_files(class_name)
+        if not files:
+            return jsonify({'total': 0, 'offset': offset, 'crop': None})
+        offset = max(0, min(offset, len(files) - 1))
+        camera, filename = files[offset]
+        meta = _parse_crop_filename(filename) or {}
+        meta['filename'] = filename
+        meta['class'] = class_name
+        meta['camera'] = camera  # image/approve/reject use the per-camera routes with this
+        return jsonify({'total': len(files), 'offset': offset, 'crop': meta})
 
     # ----- Training (global pool) -----
 
