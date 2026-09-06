@@ -45,6 +45,10 @@ class RecordingDatabase:
             self._conn.execute("ALTER TABLE events ADD COLUMN camera TEXT DEFAULT ''")
         if 'snapshot' not in columns:
             self._conn.execute('ALTER TABLE events ADD COLUMN snapshot TEXT')
+        if 'quarantined' not in columns:
+            self._conn.execute('ALTER TABLE events ADD COLUMN quarantined INTEGER DEFAULT 0')
+        if 'quarantine_reason' not in columns:
+            self._conn.execute('ALTER TABLE events ADD COLUMN quarantine_reason TEXT')
         self._conn.commit()
 
     def insert_event(self, event_id: str, start_time: datetime,
@@ -85,7 +89,7 @@ class RecordingDatabase:
     def get_events(
         self, limit: int = 50, offset: int = 0, camera: str | None = None,
     ) -> list[dict]:
-        query = 'SELECT * FROM events WHERE end_time IS NOT NULL'
+        query = 'SELECT * FROM events WHERE end_time IS NOT NULL AND COALESCE(quarantined,0)=0'
         params: list = []
         if camera:
             query += ' AND camera=?'
@@ -108,7 +112,7 @@ class RecordingDatabase:
         return dict(row) if row else None
 
     def get_event_count(self, camera: str | None = None) -> int:
-        query = 'SELECT COUNT(*) FROM events WHERE end_time IS NOT NULL'
+        query = 'SELECT COUNT(*) FROM events WHERE end_time IS NOT NULL AND COALESCE(quarantined,0)=0'
         params: list = []
         if camera:
             query += ' AND camera=?'
@@ -121,7 +125,7 @@ class RecordingDatabase:
         with self._lock:
             rows = self._conn.execute(
                 'SELECT camera, COUNT(*) FROM events WHERE end_time IS NOT NULL '
-                'GROUP BY camera'
+                'AND COALESCE(quarantined,0)=0 GROUP BY camera'
             ).fetchall()
         return {row[0]: row[1] for row in rows}
 
@@ -182,6 +186,14 @@ class RecordingDatabase:
             self._conn.execute(
                 'UPDATE events SET snapshot=? WHERE event_id=?',
                 (snapshot, event_id)
+            )
+            self._conn.commit()
+
+    def update_event_clean_clip(self, event_id: str, clean_clip: str):
+        with self._lock:
+            self._conn.execute(
+                'UPDATE events SET clean_clip=? WHERE event_id=?',
+                (clean_clip, event_id)
             )
             self._conn.commit()
 

@@ -178,7 +178,14 @@ class CameraPipeline:
             d.mkdir(parents=True, exist_ok=True)
 
         self.zone_filter = ZoneFilter(str(zones_path))
-        self.motion = MotionDetector(min_area=global_cfg.motion.min_area)
+        self.motion = MotionDetector(
+            min_area=global_cfg.motion.min_area,
+            min_area_frac=global_cfg.motion.min_area_frac,
+            var_threshold=global_cfg.motion.var_threshold,
+            history=global_cfg.motion.history,
+            detect_shadows=global_cfg.motion.detect_shadows,
+            learning_rate=global_cfg.motion.learning_rate,
+        )
         self.tracker = Tracker(
             max_age=global_cfg.tracker.max_age,
             min_hits=global_cfg.tracker.min_hits,
@@ -191,6 +198,9 @@ class CameraPipeline:
             camera=self.name,
             output_dir=self.recordings_dir,
             db=db,
+            # Detection runs on the sub-stream; pull event snapshots from the
+            # full-res clean clip instead of the small detect frame.
+            snapshot_from_clean=self.detect_url != self.url,
         )
 
         self.view = CameraView(name=self.name)
@@ -208,6 +218,7 @@ class CameraPipeline:
         self._classes_seen: dict[int, str] = {}
         self._last_uncertain_save = 0.0
         self._frame_count = 0
+        self._last_real_obj_frame = -10**9   # frame index a person/car/etc. was last seen (illumination-guard override)
 
     def start(self):
         self.recording_mgr.start()
@@ -267,6 +278,10 @@ class CameraPipeline:
         try:
             self._main_loop(cap)
         finally:
+            # Finalize any open event on every exit path (stall/lost/exception) so a reconnect
+            # or restart can't leave a NULL-end orphan with a runaway clean ffmpeg behind it.
+            if self.recording_mgr.is_recording:
+                self.recording_mgr._end_event()
             cap.release()
         return True
 
@@ -313,7 +328,16 @@ class CameraPipeline:
             scale = proc_w / full_w
             proc_frame = cv2.resize(frame, (proc_w, int(full_h * scale)))
             motion_regions = self.motion.detect(proc_frame)
-            merged = merge_overlapping_regions(motion_regions, padding=30)
+            # Whole-frame illumination guard: an IR-cut / auto-exposure / dawn step lights up the
+            # ENTIRE frame (high coverage AND every quadrant uniformly foreground). Treat that as a
+            # background step, not motion -- unless a real object was seen in the last N frames.
+            if (cfg.motion.global_change_max_fraction > 0
+                    and self.motion.last_coverage >= cfg.motion.global_change_max_fraction
+                    and self.motion.quadrant_min >= cfg.motion.global_change_min_quadrant
+                    and not self._recent_real_object()):
+                self.motion.relearn(proc_frame, -1)   # fold the new lighting into the model
+                motion_regions = []
+            merged = merge_overlapping_regions(motion_regions, padding=cfg.motion.merge_padding)
 
             inv_scale = full_w / proc_w
             merged_full = [
@@ -353,10 +377,18 @@ class CameraPipeline:
 
             tracks = self.tracker.update(det_array if ran_detection else np.empty((0, 6)))
 
-            # Maintain per-track position history for the stationary filter
+            # Maintain per-track position history for the stationary filter. Only log positions on
+            # frames where the track was actually measured (detected) so SORT's Kalman coast can't
+            # synthesise displacement and make a parked car look like it's moving.
             now_pos = time.time()
+            measured_ids = (
+                {t.id for t in self.tracker.tracks if t.time_since_update == 0}
+                if ran_detection else set()
+            )
             for row in tracks:
                 tid = int(row[4])
+                if cfg.tracker.positions_measured_only and tid not in measured_ids:
+                    continue
                 cx = (row[0] + row[2]) * 0.5
                 cy = (row[1] + row[3]) * 0.5
                 hist = self._track_positions.setdefault(tid, deque(maxlen=240))
@@ -385,7 +417,21 @@ class CameraPipeline:
                             ).append(best_det['confidence'])
 
             confirmed_ids = {tid for tid in moving_track_ids if self._is_track_confirmed(tid)}
+            # Spatially correlate the trigger with LIVE motion: a confirmed+moving track must
+            # overlap a (dilated) motion region using its current Kalman box. Kills tree-only
+            # triggers and parked cars that jitter but sit outside any fresh motion. The looser
+            # has_moving_objects gate still sustains an in-progress recording.
+            live_box = {int(r[4]): (r[0], r[1], r[2], r[3]) for r in tracks}
+            if cfg.motion.require_motion_overlap and merged_full:
+                pad = cfg.motion.overlap_dilate_px
+                dilated = [(x1 - pad, y1 - pad, x2 + pad, y2 + pad)
+                           for x1, y1, x2, y2 in merged_full]
+                confirmed_ids = {tid for tid in confirmed_ids
+                                 if tid in live_box and _overlaps_motion(live_box[tid], dilated)}
             has_moving_objects = len(confirmed_ids) > 0
+            # Note when a real object was last seen, for the illumination-guard override.
+            if confirmed_ids or (detections and any(d['class_id'] in (0, 2, 5, 7) for d in detections)):
+                self._last_real_obj_frame = self._frame_count
             in_required_zone = (
                 not self.zone_filter
                 or self.zone_filter.check_required_zones(detections, frame.shape)
@@ -398,7 +444,12 @@ class CameraPipeline:
 
             triggered = has_motion and has_moving_objects and in_required_zone
             sustain = has_motion and self.recording_mgr.is_recording and has_moving_objects
-            self.recording_mgr.update(frame, display, triggered or sustain, detections)
+            # Count/score only the confirmed+moving objects, only on detection frames, so the
+            # snapshot and top_label reflect what triggered the event, not parked cars.
+            trigger_dets = [self._track_info[tid] for tid in confirmed_ids
+                            if self._track_info.get(tid)]
+            self.recording_mgr.update(frame, display, triggered or sustain, detections,
+                                      trigger_detections=trigger_dets, count_now=ran_detection)
 
             current_event_id = self.recording_mgr.event_id
             if current_event_id != prev_event_id:
@@ -449,7 +500,7 @@ class CameraPipeline:
                                          datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
                     self._last_uncertain_save = now
 
-            # Update web view (annotated frame, capped width to keep MJPEG light)
+            # Update web view (clean frame unless live_overlays; capped width to keep MJPEG light)
             now_t = time.time()
             frame_times.append(now_t - last_loop_time)
             last_loop_time = now_t
@@ -457,22 +508,16 @@ class CameraPipeline:
                 frame_times.pop(0)
             fps = len(frame_times) / sum(frame_times) if frame_times else 0
 
-            rec_color = {'idle': (200, 200, 200), 'recording': (0, 0, 255),
-                         'cooldown': (0, 165, 255)}[self.recording_mgr.state.value]
-            cv2.putText(display, f"{self.name}  {fps:.1f}FPS",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, rec_color, 2)
-            if self.recording_mgr.is_recording:
-                cv2.circle(display, (display.shape[1] - 30, 30), 12, (0, 0, 255), -1)
-
+            web_src = display if cfg.display.live_overlays else frame
             target_w = 1920
-            if display.shape[1] > target_w:
-                ws = target_w / display.shape[1]
+            if web_src.shape[1] > target_w:
+                ws = target_w / web_src.shape[1]
                 web_frame = cv2.resize(
-                    display, (target_w, int(display.shape[0] * ws)),
+                    web_src, (target_w, int(web_src.shape[0] * ws)),
                     interpolation=cv2.INTER_AREA,
                 )
             else:
-                web_frame = display
+                web_frame = web_src
             with self.view.frame_cond:
                 self.view.frame = web_frame
                 self.view.frame_version += 1
@@ -499,26 +544,33 @@ class CameraPipeline:
                 time.sleep(min_frame_time - elapsed)
 
     def _is_track_moving(self, tid: int) -> bool:
-        """True if the track moved at least min_displacement px within stationary_window seconds."""
+        """True if the track's smoothed centroid shifted past a box-relative threshold over the
+        recent window. Jitter-robust: needs several MEASURED samples and compares the mean of the
+        first third vs the last third, so a parked car's detection jitter never reads as motion."""
+        tcfg = self.cfg.tracker
         hist = self._track_positions.get(tid)
-        if not hist or len(hist) < 2:
-            return True  # too new — treat as moving so first-seen objects aren't ignored
-        window = self.cfg.tracker.stationary_window
-        min_disp = self.cfg.tracker.stationary_min_displacement
+        if not hist or len(hist) < tcfg.stationary_min_samples:
+            return False  # not enough measured evidence yet — don't trigger on a brand-new track
         now = hist[-1][2]
-        oldest = None
-        for entry in hist:
-            if now - entry[2] <= window:
-                oldest = entry
-                break
-        if oldest is None:
-            return True
-        # Need at least half the window of history before we call it stationary
-        if now - oldest[2] < window * 0.5:
-            return True
-        dx = hist[-1][0] - oldest[0]
-        dy = hist[-1][1] - oldest[1]
-        return math.hypot(dx, dy) >= min_disp
+        recent = [p for p in hist if now - p[2] <= tcfg.stationary_window]
+        if len(recent) < tcfg.stationary_min_samples:
+            return False
+        # Compare the mean of the first third vs the last third to smooth out box jitter.
+        k = max(1, len(recent) // 3)
+        sx0 = sum(p[0] for p in recent[:k]) / k
+        sy0 = sum(p[1] for p in recent[:k]) / k
+        sx1 = sum(p[0] for p in recent[-k:]) / k
+        sy1 = sum(p[1] for p in recent[-k:]) / k
+        disp = math.hypot(sx1 - sx0, sy1 - sy0)
+        # Threshold scales with box size so a large parked car's jitter doesn't read as motion,
+        # while a small distant walker still clears the absolute floor.
+        min_disp = tcfg.stationary_min_displacement
+        info = self._track_info.get(tid)
+        if info and info.get('box'):
+            bx1, by1, bx2, by2 = info['box']
+            diag = math.hypot(bx2 - bx1, by2 - by1)
+            min_disp = max(min_disp, tcfg.stationary_disp_box_frac * diag)
+        return disp >= min_disp
 
     def _is_track_confirmed(self, tid: int) -> bool:
         """True once a track has at least confirm_min_count detections whose median
@@ -533,6 +585,13 @@ class CameraPipeline:
             threshold = self.cfg.detection.confirm_threshold_by_class.get(
                 info['class_id'], threshold)
         return statistics.median(scores) >= threshold
+
+    def _recent_real_object(self) -> bool:
+        """True if a person/car/truck/bus was detected or a track confirmed within the last
+        recent_real_object_frames frames. Vetoes the illumination guard so a genuine arrival that
+        happens to light up the frame (e.g. headlights at night) is never suppressed."""
+        return (self._frame_count - self._last_real_obj_frame
+                <= self.cfg.motion.recent_real_object_frames)
 
     def _save_crop(self, frame, box, track_id, class_name, confidence, padding=20):
         h, w = frame.shape[:2]

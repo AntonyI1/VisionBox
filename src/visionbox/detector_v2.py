@@ -272,7 +272,9 @@ def create_surveillance_detector(device: str = 'auto') -> MultiModelDetector:
 
 
 CLASS_PRESETS_V2 = {
-    'outdoor': [0, 1, 2, 3, 5, 7, 14, 15, 16, 80],
+    # person, bicycle, car, motorcycle, bus, truck, bird, cat, dog,
+    # horse, sheep, cow, bear, backpack, umbrella, handbag, suitcase, license_plate
+    'outdoor': [0, 1, 2, 3, 5, 7, 14, 15, 16, 17, 18, 19, 21, 24, 25, 26, 28, 80],
     'indoor': [0, 39, 41, 56, 57, 59, 60, 62, 63, 64, 65, 66, 67, 73, 74, 81],
     'vehicles': [1, 2, 3, 5, 7, 80],
     'all': None,

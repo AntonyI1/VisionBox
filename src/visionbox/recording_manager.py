@@ -1,5 +1,6 @@
 """Orchestrates dual recording (clean + annotated), database, and retention."""
 
+import subprocess
 import threading
 import time
 from collections import Counter
@@ -20,6 +21,22 @@ EDGE_PENALTY = 0.6        # multiplier per touched border (compounds)
 AREA_WEIGHT = 0.5         # area_ratio**0.5 softens dominance of very large boxes
 
 
+def _upgrade_snapshot(clip_path: str, offset: float, dest: Path):
+    """Replace a detect-stream snapshot with the same moment from the full-res clean clip."""
+    tmp = dest.with_name(dest.stem + '.tmp.jpg')
+    cmd = ['ffmpeg', '-ss', f'{offset:.2f}', '-i', clip_path,
+           '-frames:v', '1', '-q:v', '2', '-y', str(tmp)]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=60)
+        if proc.returncode == 0 and tmp.stat().st_size > 0:
+            tmp.replace(dest)
+            return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    tmp.unlink(missing_ok=True)
+
+
 class RecordingManager:
     def __init__(
         self,
@@ -28,14 +45,18 @@ class RecordingManager:
         camera: str = '',
         output_dir: str | Path | None = None,
         db: RecordingDatabase | None = None,
+        snapshot_from_clean: bool = False,
     ):
         self.config = config
         self.camera = camera
         self.output_dir = Path(output_dir) if output_dir else Path(config.output_dir)
+        self.snapshot_from_clean = snapshot_from_clean
         self._detection_counts: Counter = Counter()
         self._best_thumb: np.ndarray | None = None
         self._best_snapshot: np.ndarray | None = None
         self._best_score: float = 0.0
+        self._best_ts: float = 0.0
+        self._clean_start_ts: float = 0.0
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -43,11 +64,15 @@ class RecordingManager:
             output_dir=str(self.output_dir / 'annotated'),
             cooldown=config.annotated.cooldown,
             fps=config.annotated.fps,
+            max_duration=config.annotated.max_duration,
         ) if config.annotated.enabled else None
 
         self.clean = CleanRecorder(
             output_dir=self.output_dir / 'clean',
             rtsp_url=rtsp_url,
+            max_duration=config.clean.max_duration,
+            min_valid_bytes=config.clean.min_valid_bytes,
+            stop_grace=config.clean.stop_grace,
         ) if config.clean.enabled else None
 
         if db is not None:
@@ -99,6 +124,8 @@ class RecordingManager:
         annotated_frame: np.ndarray | None,
         triggered: bool,
         detections: list[dict] | None = None,
+        trigger_detections: list[dict] | None = None,
+        count_now: bool = True,
     ):
         was_recording = self._current_event_id is not None
 
@@ -113,15 +140,20 @@ class RecordingManager:
         elif not was_recording and self.annotated is None and triggered:
             self._start_event()
 
-        if self._current_event_id and detections:
-            score = self._frame_score(detections, frame.shape[1], frame.shape[0])
+        # Score the snapshot and tally labels from the trigger subset (confirmed+moving objects)
+        # when provided, so parked cars no longer dominate top_label / detection_count / snapshot.
+        score_dets = trigger_detections if trigger_detections is not None else detections
+        if self._current_event_id and score_dets:
+            score = self._frame_score(score_dets, frame.shape[1], frame.shape[0])
             if score > self._best_score:
                 self._best_score = score
                 self._best_snapshot = frame.copy()  # clean, unannotated
+                self._best_ts = time.time()
                 self._best_thumb = (annotated_frame.copy()
                                     if annotated_frame is not None else frame.copy())
-            for d in detections:
-                self._detection_counts[d.get('class_name', 'unknown')] += 1
+            if count_now:
+                for d in score_dets:
+                    self._detection_counts[d.get('class_name', 'unknown')] += 1
 
         if was_recording:
             annotated_idle = self.annotated is None or self.annotated.state == RecorderState.IDLE
@@ -155,12 +187,14 @@ class RecordingManager:
         self._best_thumb = None
         self._best_snapshot = None
         self._best_score = 0.0
+        self._best_ts = 0.0
 
         clean_clip = ''
         if self.clean:
             path = self.clean.start_event(event_id)
             if path:
                 clean_clip = f'clean/event_{event_id}.mp4'
+                self._clean_start_ts = time.time()
 
         annotated_clip = ''
         if self.annotated and self.annotated.event_id:
@@ -178,8 +212,17 @@ class RecordingManager:
         now = datetime.now()
         duration = (now - self._event_start).total_seconds() if self._event_start else 0
 
-        if self.clean and self.clean.is_recording:
-            self.clean.stop_event()
+        clean_path = None
+        if self.clean:
+            if self.clean.is_recording:
+                clean_path = self.clean.stop_event()
+                if clean_path is None:
+                    # broken/empty clean clip was discarded — clear the dangling DB pointer
+                    self.db.update_event_clean_clip(self._current_event_id, '')
+            else:
+                # ffmpeg already exited (-t cap); the clip may still exist on disk
+                p = self.output_dir / 'clean' / f'event_{self._current_event_id}.mp4'
+                clean_path = str(p) if p.exists() else None
 
         top_label = ''
         total_detections = sum(self._detection_counts.values())
@@ -201,9 +244,19 @@ class RecordingManager:
 
         if self._best_snapshot is not None:
             snap_rel = f'snapshots/event_{self._current_event_id}.jpg'
-            cv2.imwrite(str(self.output_dir / snap_rel), self._best_snapshot,
+            snap_path = self.output_dir / snap_rel
+            cv2.imwrite(str(snap_path), self._best_snapshot,
                         [cv2.IMWRITE_JPEG_QUALITY, 90])
             self.db.update_event_snapshot(self._current_event_id, snap_rel)
+            if self.snapshot_from_clean and clean_path and self._best_ts:
+                # Detect-stream frame is low-res; swap in the same moment from the
+                # full-res clean clip. The file above stays as the fallback.
+                offset = min(max(0.0, self._best_ts - self._clean_start_ts),
+                             max(0.0, self.config.clean.max_duration - 1.0))
+                threading.Thread(
+                    target=_upgrade_snapshot, args=(clean_path, offset, snap_path),
+                    daemon=True, name=f'snapshot-{self.camera or "default"}',
+                ).start()
 
         self._current_event_id = None
         self._event_start = None
@@ -211,6 +264,7 @@ class RecordingManager:
         self._best_thumb = None
         self._best_snapshot = None
         self._best_score = 0.0
+        self._best_ts = 0.0
         self._enforce_limits()
 
     def _enforce_limits(self):

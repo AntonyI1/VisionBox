@@ -11,10 +11,15 @@ from datetime import datetime, timezone
 class CleanRecorder:
     """Records raw RTSP stream via FFmpeg -c copy. No bounding boxes."""
 
-    def __init__(self, output_dir: str | Path, rtsp_url: str = ''):
+    def __init__(self, output_dir: str | Path, rtsp_url: str = '',
+                 max_duration: float = 130.0, min_valid_bytes: int = 51200,
+                 stop_grace: float = 5.0):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.rtsp_url = rtsp_url
+        self.max_duration = max_duration
+        self.min_valid_bytes = min_valid_bytes
+        self.stop_grace = stop_grace
         self._process: subprocess.Popen | None = None
         self._current_path: Path | None = None
         self._event_id: str | None = None
@@ -44,7 +49,9 @@ class CleanRecorder:
             '-rtsp_transport', 'tcp',
             '-i', self.rtsp_url,
             '-c', 'copy', '-an',
-            '-movflags', '+faststart',
+            '-t', str(self.max_duration),
+            # Fragmented MP4: a SIGKILL/-t cut still leaves a playable file (no trailing moov needed).
+            '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
             '-y', str(self._current_path),
         ]
 
@@ -64,13 +71,23 @@ class CleanRecorder:
 
         try:
             self._process.send_signal(signal.SIGINT)
-            self._process.wait(timeout=5)
+            self._process.wait(timeout=self.stop_grace)
         except (subprocess.TimeoutExpired, OSError):
             self._process.kill()
             self._process.wait()
 
         self._process = None
         path = self._current_path
+
+        # Drop broken/empty clips. With fragmented MP4 even a killed ffmpeg leaves a playable
+        # file, so anything under the floor is genuinely unusable; null it so callers can clear
+        # the DB column while keeping the annotated clip + event row.
+        if path and path.exists() and path.stat().st_size < self.min_valid_bytes:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            path = None
 
         if path and path.exists() and self._start_time:
             meta_path = path.with_suffix('.json')
