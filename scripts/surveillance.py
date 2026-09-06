@@ -7,6 +7,7 @@ import math
 import os
 import re
 import signal
+import socket
 import statistics
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, 'src')
 
@@ -53,6 +55,26 @@ def _redact_url(url: str) -> str:
     return re.sub(r'://[^/@]*@', '://***@', url)
 
 
+def _rtsp_ready(url: str, timeout: float = 4.0) -> bool:
+    """Liveness probe before the heavy cv2 open. A wedged source (TCP accepts, data
+    never comes) makes every VideoCapture retry churn ffmpeg allocations — days of
+    that fragments the heap until av_frame_get_buffer fails for ALL cameras. Any
+    RTSP status line counts as alive (401/454 still prove the server talks);
+    timeout, refusal, or an empty reply means don't bother opening."""
+    if not url.startswith('rtsp://'):
+        return True  # file/test inputs
+    parsed = urlparse(url)
+    try:
+        with socket.create_connection((parsed.hostname, parsed.port or 554),
+                                      timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall((f"DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\n"
+                          "Accept: application/sdp\r\nUser-Agent: VisionBox\r\n\r\n").encode())
+            return sock.recv(64).startswith(b'RTSP/1.0 ')
+    except OSError:
+        return False
+
+
 class CameraStream:
     """Threaded RTSP reader — always returns the latest frame."""
 
@@ -64,19 +86,27 @@ class CameraStream:
         self.last_frame_time = time.time()
         self.lock = threading.Lock()
         self.stopped = False
-        threading.Thread(target=self._reader, daemon=True,
-                         name='rtsp-reader').start()
+        self._thread = threading.Thread(target=self._reader, daemon=True,
+                                        name='rtsp-reader')
+        self._thread.start()
 
     def _reader(self):
-        while not self.stopped:
-            ret, frame = self.cap.read()
-            with self.lock:
-                self.ret = ret
-                self.frame = frame
-            if ret and frame is not None:
-                self.last_frame_time = time.time()
-            else:
-                time.sleep(0.1)
+        # The cap is released HERE, in the same thread that reads it. Releasing a
+        # VideoCapture from another thread while this one is inside cap.read() is a
+        # use-after-free in ffmpeg/OpenCV and segfaults the whole process — which is
+        # what happened on every flaky-WiFi reconnect.
+        try:
+            while not self.stopped:
+                ret, frame = self.cap.read()
+                with self.lock:
+                    self.ret = ret
+                    self.frame = frame
+                if ret and frame is not None:
+                    self.last_frame_time = time.time()
+                else:
+                    time.sleep(0.1)
+        finally:
+            self.cap.release()
 
     def read(self):
         with self.lock:
@@ -86,8 +116,38 @@ class CameraStream:
         return self.cap.isOpened()
 
     def release(self):
+        # Signal the reader to stop and let IT release the cap; never release across
+        # threads. join() waits out an in-flight read (RTSP timeout ~5s); if it can't,
+        # the daemon reader still releases the cap itself when read() finally returns.
         self.stopped = True
-        self.cap.release()
+        if self._thread is not None:
+            self._thread.join(timeout=6)
+            self._thread = None
+
+
+def start_rss_watchdog(max_rss_mb: int):
+    """Self-restart valve for slow leaks: a bloated resident set starves frame
+    buffers for every camera long before the kernel OOM-killer cares. Three
+    strikes, then SIGTERM ourselves so open events finalize and systemd respawns
+    us; hard-exit only if that graceful shutdown wedges."""
+    def _watch():
+        strikes = 0
+        while True:
+            time.sleep(60)
+            try:
+                with open('/proc/self/status') as f:
+                    rss_kb = next(int(line.split()[1]) for line in f
+                                  if line.startswith('VmRSS'))
+            except (OSError, StopIteration, ValueError):
+                continue
+            strikes = strikes + 1 if rss_kb > max_rss_mb * 1024 else 0
+            if strikes >= 3:
+                print(f"[watchdog] RSS {rss_kb // 1024}MB above {max_rss_mb}MB cap "
+                      f"for 3 checks; restarting for a clean slate", flush=True)
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(60)
+                os._exit(42)
+    threading.Thread(target=_watch, daemon=True, name='rss-watchdog').start()
 
 
 def open_browser(url: str):
@@ -258,6 +318,13 @@ class CameraPipeline:
 
     def _connect_and_process(self) -> bool:
         stream_url = self.test_input or self.detect_url
+        if not _rtsp_ready(stream_url):
+            self.view.connected = False
+            if self.view.last_error != 'source unreachable':
+                print(f"[{self.name}] source unreachable, retrying quietly until it answers",
+                      flush=True)
+            self.view.last_error = 'source unreachable'
+            return False
         print(f"[{self.name}] connecting to {_redact_url(stream_url)}", flush=True)
         cap = CameraStream(stream_url)
         if not cap.isOpened():
@@ -744,6 +811,8 @@ def main():
                 print(f"[reload] failed: {type(exc).__name__}: {exc}", flush=True)
         threading.Thread(target=_do, daemon=True, name='model-reload').start()
     signal.signal(signal.SIGHUP, _reload_model)
+
+    start_rss_watchdog(int(os.environ.get('VISIONBOX_MAX_RSS_MB', '4096')))
 
     try:
         stop.wait()
