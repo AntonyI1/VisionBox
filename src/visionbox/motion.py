@@ -1,8 +1,9 @@
 """Motion detection via MOG2 background subtraction."""
 
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
-from dataclasses import dataclass
 
 
 @dataclass
@@ -28,28 +29,37 @@ class MotionDetector:
         learning_rate: float = -1,
         min_area_frac: float = 0.0,
     ):
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=history,
-            varThreshold=var_threshold,
-            detectShadows=detect_shadows,
-        )
+        self.history = history
+        self.var_threshold = var_threshold
+        self.detect_shadows = detect_shadows
         self.min_area = min_area
         self.min_area_frac = min_area_frac
         self.learning_rate = learning_rate
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        # Set by detect(): full-frame foreground fraction and the min across the 4 quadrants.
-        # Used by the caller's whole-frame illumination guard.
+        # Foreground fraction of the last frame and the minimum over its four quadrants,
+        # read by the caller's whole-frame illumination guard.
         self.last_coverage = 0.0
         self.quadrant_min = 0.0
+        self.bg_subtractor = self._new_subtractor()
+
+    def _new_subtractor(self):
+        return cv2.createBackgroundSubtractorMOG2(
+            history=self.history,
+            varThreshold=self.var_threshold,
+            detectShadows=self.detect_shadows,
+        )
 
     def relearn(self, frame: np.ndarray, rate: float = -1):
         """Fold one frame into the background model without returning regions."""
         self.bg_subtractor.apply(frame, learningRate=rate)
 
-    def detect(self, frame: np.ndarray) -> list[MotionRegion]:
+    def _foreground(self, frame: np.ndarray) -> np.ndarray:
         fg_mask = self.bg_subtractor.apply(frame, learningRate=self.learning_rate)
         fg_mask = cv2.erode(fg_mask, self.kernel, iterations=1)
-        fg_mask = cv2.dilate(fg_mask, self.kernel, iterations=2)
+        return cv2.dilate(fg_mask, self.kernel, iterations=2)
+
+    def detect(self, frame: np.ndarray) -> list[MotionRegion]:
+        fg_mask = self._foreground(frame)
 
         h_m, w_m = fg_mask.shape[:2]
         self.last_coverage = float(cv2.countNonZero(fg_mask)) / float(h_m * w_m)
@@ -73,15 +83,10 @@ class MotionDetector:
         return regions
 
     def get_mask(self, frame: np.ndarray) -> np.ndarray:
-        fg_mask = self.bg_subtractor.apply(frame, learningRate=self.learning_rate)
-        fg_mask = cv2.erode(fg_mask, self.kernel, iterations=1)
-        fg_mask = cv2.dilate(fg_mask, self.kernel, iterations=2)
-        return fg_mask
+        return self._foreground(frame)
 
     def reset(self):
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500, varThreshold=16.0, detectShadows=False,
-        )
+        self.bg_subtractor = self._new_subtractor()
 
 
 def merge_overlapping_regions(
@@ -92,12 +97,10 @@ def merge_overlapping_regions(
     if not regions:
         return []
 
-    boxes = []
-    for r in regions:
-        boxes.append([
-            max(0, r.x - padding), max(0, r.y - padding),
-            r.x + r.w + padding, r.y + r.h + padding,
-        ])
+    boxes = [
+        [max(0, r.x - padding), max(0, r.y - padding), r.x + r.w + padding, r.y + r.h + padding]
+        for r in regions
+    ]
 
     merged = []
     used = [False] * len(boxes)
