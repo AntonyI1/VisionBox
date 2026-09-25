@@ -1,5 +1,6 @@
 """Multi-model YOLO detector with auto backend selection (TensorRT > OpenVINO > PyTorch)."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,19 +16,23 @@ def _has_cuda() -> bool:
         return False
 
 
+def _as_numpy(tensor) -> np.ndarray:
+    return tensor.cpu().numpy() if hasattr(tensor, 'cpu') else np.asarray(tensor)
+
+
 @dataclass
 class ModelConfig:
     path: str
     class_offset: int = 0
-    class_names: dict = None
+    class_names: dict[int, str] | None = None
     conf_threshold: float = 0.25
-    class_conf: dict = None
+    class_conf: dict[int, float] | None = None
 
 
 class MultiModelDetector:
     def __init__(
         self,
-        model_configs: list[ModelConfig] = None,
+        model_configs: list[ModelConfig] | None = None,
         device: str = 'auto',
         imgsz: int = 640
     ):
@@ -72,20 +77,15 @@ class MultiModelDetector:
     def reload(self, swap_lock=None) -> dict:
         """Rebuild every model from disk (after an on-box training hot-swap) and re-warm.
 
-        The heavy work — load + warmup of the NEW models — runs WITHOUT holding
-        swap_lock, so live inference keeps going; only the final pointer swap is done
-        under the lock (sub-millisecond), so cameras are never blind for more than a
-        frame. Re-resolves the OpenVINO device so a model that fell back to CPU can
-        return to the iGPU.
+        Loading and warming the new models happens outside swap_lock so live inference
+        keeps going; only the final pointer swap runs under it. The OpenVINO device is
+        re-resolved so a model that fell back to CPU can return to the iGPU.
         """
         self.ov_device = self._resolve_ov_device(self._device_arg)
         configs = [config for _, config, _ in self.models]
         new_models, new_class_names = self._build_models(configs)
         self._warmup(new_models)
-        if swap_lock is not None:
-            with swap_lock:
-                self.models, self.class_names = new_models, new_class_names
-        else:
+        with swap_lock if swap_lock is not None else nullcontext():
             self.models, self.class_names = new_models, new_class_names
         print(f"Reloaded {len(self.models)} model(s) on {self.effective_device}", flush=True)
         return {
@@ -113,11 +113,10 @@ class MultiModelDetector:
             return 'intel:cpu'
         try:
             from openvino import Core
-            if 'GPU' in Core().available_devices:
-                return 'intel:gpu'
+            available = Core().available_devices
         except Exception:
-            pass
-        return 'intel:cpu'
+            available = []
+        return 'intel:gpu' if 'GPU' in available else 'intel:cpu'
 
     @property
     def effective_device(self) -> str:
@@ -129,7 +128,7 @@ class MultiModelDetector:
         """Prime each model (compiles GPU kernels) so the first real frame isn't slow."""
         blank = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
         for model, _, is_openvino in (models if models is not None else self.models):
-            kw = dict(imgsz=self.imgsz, verbose=False)
+            kw = {'imgsz': self.imgsz, 'verbose': False}
             if is_openvino:
                 kw['device'] = self.ov_device
             try:
@@ -160,9 +159,8 @@ class MultiModelDetector:
     def _infer(self, model, frame, conf, iou_threshold, is_openvino):
         """Run one model; route OpenVINO to the iGPU with automatic CPU fallback."""
         if not is_openvino:
-            use_half = self.device not in ('cpu', 'auto')
             return model(frame, conf=conf, iou=iou_threshold, verbose=False,
-                         half=use_half, imgsz=self.imgsz)
+                         half=self.device != 'cpu', imgsz=self.imgsz)
         try:
             return model(frame, conf=conf, iou=iou_threshold, verbose=False,
                          imgsz=self.imgsz, device=self.ov_device)
@@ -180,12 +178,12 @@ class MultiModelDetector:
         frame: np.ndarray,
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
-        classes: list[int] = None
+        classes: list[int] | None = None
     ) -> list[dict]:
         all_detections = []
 
         for model, config, is_openvino in self.models:
-            conf = config.conf_threshold if config.conf_threshold else conf_threshold
+            conf = config.conf_threshold or conf_threshold
             results = self._infer(model, frame, conf, iou_threshold, is_openvino)
 
             for result in results:
@@ -193,14 +191,10 @@ class MultiModelDetector:
                 if boxes is None or len(boxes) == 0:
                     continue
 
-                xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, 'cpu') else np.array(boxes.xyxy)
-                confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else np.array(boxes.conf)
-                clss = boxes.cls.cpu().numpy() if hasattr(boxes.cls, 'cpu') else np.array(boxes.cls)
-
-                for i in range(len(boxes)):
-                    box = xyxy[i]
-                    conf_score = float(confs[i])
-                    orig_class_id = int(clss[i])
+                xyxy, confs, clss = (_as_numpy(t) for t in (boxes.xyxy, boxes.conf, boxes.cls))
+                for box, score, cls in zip(xyxy, confs, clss, strict=True):
+                    conf_score = float(score)
+                    orig_class_id = int(cls)
                     unified_class_id = orig_class_id + config.class_offset
 
                     if classes is not None and unified_class_id not in classes:
@@ -212,7 +206,7 @@ class MultiModelDetector:
                             continue
 
                     all_detections.append({
-                        'box': [int(box[0]), int(box[1]), int(box[2]), int(box[3])],
+                        'box': [int(v) for v in box],
                         'confidence': conf_score,
                         'class_id': unified_class_id,
                         'class_name': self.class_names.get(unified_class_id, f'class_{unified_class_id}')
@@ -225,7 +219,7 @@ class MultiModelDetector:
         frame: np.ndarray,
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
-        classes: list[int] = None
+        classes: list[int] | None = None
     ) -> np.ndarray:
         """Returns (N, 6) array: [x1, y1, x2, y2, confidence, class_id]."""
         detections = self.detect(frame, conf_threshold, iou_threshold, classes)
