@@ -217,9 +217,8 @@ def _apply_dict(dc, data: dict):
 def _build_cameras(raw_cameras: dict) -> dict[str, CameraConfig]:
     cameras = {}
     for name, body in (raw_cameras or {}).items():
-        body = body or {}
         cam = CameraConfig(name=name)
-        _apply_dict(cam, body)
+        _apply_dict(cam, body or {})
         cam.name = name  # body cannot override the dict key
         cameras[name] = cam
     return cameras
