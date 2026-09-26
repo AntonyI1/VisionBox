@@ -516,9 +516,12 @@ def create_app(state: CamerasState) -> Flask:
 
     # ----- Review (per camera, per class) -----
 
+    def _camera_crops(name: str) -> Path:
+        return _safe_path(state.crops_dir, name)
+
     @app.route('/api/cameras/<name>/review/classes')
     def review_classes(name):
-        cam_crops = state.crops_dir / name
+        cam_crops = _camera_crops(name)
         if not cam_crops.is_dir():
             return jsonify([])
         out = []
@@ -536,7 +539,7 @@ def create_app(state: CamerasState) -> Flask:
     @app.route('/api/cameras/<name>/review/<class_name>')
     def review_crop(name, class_name):
         offset = request.args.get('offset', 0, type=int)
-        files = _list_images(state.crops_dir / name, class_name)
+        files = _list_images(_camera_crops(name), class_name)
         if not files:
             return jsonify({'total': 0, 'offset': offset, 'crop': None})
         offset = max(0, min(offset, len(files) - 1))
@@ -549,14 +552,14 @@ def create_app(state: CamerasState) -> Flask:
 
     @app.route('/api/cameras/<name>/review/<class_name>/<filename>/image')
     def review_image(name, class_name, filename):
-        path = _safe_path(state.crops_dir / name, class_name, filename)
+        path = _safe_path(_camera_crops(name), class_name, filename)
         if not path.is_file():
             abort(404)
         return send_file(str(path), mimetype='image/jpeg')
 
     @app.route('/api/cameras/<name>/review/<class_name>/<filename>/approve', methods=['POST'])
     def review_approve(name, class_name, filename):
-        src = _safe_path(state.crops_dir / name, class_name, filename)
+        src = _safe_path(_camera_crops(name), class_name, filename)
         if not src.is_file():
             abort(404)
         dest_dir = _safe_path(state.training_dir, class_name)
@@ -568,7 +571,7 @@ def create_app(state: CamerasState) -> Flask:
 
     @app.route('/api/cameras/<name>/review/<class_name>/<filename>/reject', methods=['POST'])
     def review_reject(name, class_name, filename):
-        src = _safe_path(state.crops_dir / name, class_name, filename)
+        src = _safe_path(_camera_crops(name), class_name, filename)
         if not src.is_file():
             abort(404)
         src.unlink()
