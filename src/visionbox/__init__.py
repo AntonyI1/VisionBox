@@ -1,6 +1,6 @@
 """VisionBox - AI-powered video surveillance."""
 
-from .api import CamerasState, CameraView, PipelineState, start_api_server
+from .api import CamerasState, CameraView, start_api_server
 from .clean_recorder import CleanRecorder
 from .config import StorageConfig, VisionBoxConfig, load_config
 from .database import RecordingDatabase
@@ -30,7 +30,6 @@ __all__ = [
     'MotionDetector',
     'MotionRegion',
     'MultiModelDetector',
-    'PipelineState',
     'RecordingDatabase',
     'RecordingManager',
     'StorageConfig',
