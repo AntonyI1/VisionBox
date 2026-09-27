@@ -33,26 +33,18 @@
             '</span><span class="meta-value">' + value + '</span></div>';
     }
 
+    function option(value, text) {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = text;
+        return opt;
+    }
+
     function populateCamSelect(sel, includeAll, currentVal) {
         const prev = currentVal !== undefined ? currentVal : sel.value;
         sel.innerHTML = '';
-        if (includeAll) {
-            const opt = document.createElement('option');
-            opt.value = '';
-            opt.textContent = 'All cameras';
-            sel.appendChild(opt);
-        } else {
-            const opt = document.createElement('option');
-            opt.value = '';
-            opt.textContent = 'Select camera...';
-            sel.appendChild(opt);
-        }
-        cameraNames.forEach(n => {
-            const opt = document.createElement('option');
-            opt.value = n;
-            opt.textContent = n;
-            sel.appendChild(opt);
-        });
+        sel.appendChild(option('', includeAll ? 'All cameras' : 'Select camera...'));
+        cameraNames.forEach(n => sel.appendChild(option(n, n)));
         if (prev && cameraNames.includes(prev)) sel.value = prev;
     }
 
@@ -170,7 +162,7 @@
     const liveEmpty = document.getElementById('live-empty');
     const tileRefs = new Map();
 
-    // Each open /stream holds a server encode thread; only stream a tile when its frame can be seen.
+    // Each open /stream holds a server worker thread; only stream a tile while it can be seen.
     function gridShouldStream() {
         return currentView === 'live' && !focusedCam && !document.hidden;
     }
@@ -194,7 +186,6 @@
             return;
         }
         liveEmpty.style.display = 'none';
-        // Layout class for grid columns: 1, 2, 4, etc.
         const cols = cameras.length <= 1 ? 1 : cameras.length <= 4 ? 2 : 3;
         liveGrid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
         const frag = document.createDocumentFragment();
@@ -656,7 +647,7 @@
         reviewClass = '';
         reviewClassSelect.innerHTML = '<option value="">Select class...</option>';
         clearReview();
-        loadReviewClasses();   // works for a specific camera or '' = all
+        loadReviewClasses();
     });
 
     function loadReviewClasses() {
@@ -667,12 +658,7 @@
             .then(r => r.json())
             .then(classes => {
                 reviewClassSelect.innerHTML = '<option value="">Select class...</option>';
-                classes.forEach(c => {
-                    const opt = document.createElement('option');
-                    opt.value = c.name;
-                    opt.textContent = c.name + ' (' + c.count + ')';
-                    reviewClassSelect.appendChild(opt);
-                });
+                classes.forEach(c => reviewClassSelect.appendChild(option(c.name, c.name + ' (' + c.count + ')')));
                 if (reviewClass) reviewClassSelect.value = reviewClass;
             });
     }
@@ -784,12 +770,7 @@
             .then(r => r.json())
             .then(classes => {
                 trainingClassSelect.innerHTML = '<option value="">Select class...</option>';
-                classes.forEach(c => {
-                    const opt = document.createElement('option');
-                    opt.value = c.name;
-                    opt.textContent = c.name + ' (' + c.count + ')';
-                    trainingClassSelect.appendChild(opt);
-                });
+                classes.forEach(c => trainingClassSelect.appendChild(option(c.name, c.name + ' (' + c.count + ')')));
                 if (trainingClass) trainingClassSelect.value = trainingClass;
             });
     }

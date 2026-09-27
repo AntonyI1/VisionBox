@@ -1,4 +1,4 @@
-const CACHE = 'visionbox-static-v2';
+const CACHE = 'visionbox-static-v3';
 const OFFLINE_PAGE = '/static/offline.html';
 const PRECACHE = [
     OFFLINE_PAGE,
