@@ -301,7 +301,7 @@ class LogParsers(unittest.TestCase):
                  '2026-09-11 21:54:56.1  OSError: [Errno 116] Stale file handle',
                  'no timestamp line inherits previous',
                  '2026-09-11 21:50:00.0  Exception in thread too_old:']
-        since = cd.datetime(2026, 9, 11, 21, 52, tzinfo=cd.timezone.utc).timestamp()
+        since = cd.datetime(2026, 9, 11, 21, 52, tzinfo=cd.UTC).timestamp()
         f = cd.parse_frigate_log(lines, since)
         self.assertEqual(f['dead_thread'], ['event_cleanup'])
         self.assertEqual(f['unprocessed'], {'backyard': 1})
@@ -310,7 +310,7 @@ class LogParsers(unittest.TestCase):
 
     def test_parse_go2rtc_log(self):
         ipmap = {'192.0.2.11': 'front_garage', '192.0.2.12': 'backyard'}
-        since = cd.datetime(2026, 9, 13, 18, 0, tzinfo=cd.timezone.utc).timestamp()
+        since = cd.datetime(2026, 9, 13, 18, 0, tzinfo=cd.UTC).timestamp()
         g = cd.parse_go2rtc_log([GO2RTC_LINE, GO2RTC_LINE.replace('249', '101').replace('i/o timeout', 'RTP header size insufficient'),
                                  '2026-09-13 17:15:11.7  10:15:11.748 INF go2rtc platform=linux/amd64'], since, ipmap)
         self.assertEqual(g['timeouts'], {'front_garage': 1, 'backyard': 1})
