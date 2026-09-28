@@ -1,80 +1,49 @@
 #!/usr/bin/env python3
-"""Live camera detection demo with multi-model detection and tracking."""
+"""Live detection + tracking demo for one camera stream (OpenCV window).
+
+    python scripts/camera_demo.py rtsp://... [--mode outdoor] [--conf 0.25]
+
+Falls back to CAMERA_URL from .env. Keys: q quit, r reset tracks.
+"""
 
 import argparse
 import os
 import sys
-sys.path.insert(0, 'src')
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'src'))
 
 from dotenv import load_dotenv
-load_dotenv()
+
+load_dotenv(ROOT / '.env')
 
 import cv2
-import time
 import numpy as np
-from visionbox import Tracker, create_surveillance_detector, CLASS_PRESETS_V2
 
-np.random.seed(42)
-COLORS = [(int(c[0]), int(c[1]), int(c[2])) for c in np.random.randint(0, 255, (100, 3))]
-
-
-def draw_tracks(
-    image: np.ndarray,
-    tracks: np.ndarray,
-    track_classes: dict[int, int],
-    class_names: dict[int, str]
-) -> np.ndarray:
-    """Draw tracked bounding boxes with IDs and class names."""
-    for track in tracks:
-        x1, y1, x2, y2, track_id = track
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        track_id = int(track_id)
-
-        # Get class name for this track
-        class_id = track_classes.get(track_id, 0)
-        class_name = class_names.get(class_id, f'class_{class_id}')
-
-        # Consistent color per track ID
-        color = COLORS[track_id % len(COLORS)]
-
-        # Highlight license plates differently
-        if class_id == 80:  # license_plate
-            color = (0, 255, 255)  # Yellow for plates
-            label = f"PLATE #{track_id}"
-        else:
-            label = f"{class_name} #{track_id}"
-
-        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-
-        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(image, (x1, y1 - h - 10), (x1 + w, y1), color, -1)
-        cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-
-    return image
+from visionbox import CLASS_PRESETS_V2, Tracker, create_surveillance_detector
+from visionbox.viz import draw_tracks
 
 
 def main():
-    parser = argparse.ArgumentParser(description='VisionBox Detection Demo')
-    parser.add_argument('url', nargs='?', help='Camera URL')
+    parser = argparse.ArgumentParser(description='VisionBox detection demo')
+    parser.add_argument('url', nargs='?', help='Camera URL (default: CAMERA_URL from .env)')
     parser.add_argument('--mode', choices=['outdoor', 'indoor', 'vehicles', 'all'], default='all',
-                        help='Detection mode: outdoor, indoor, vehicles, all')
+                        help='Class preset to detect')
     parser.add_argument('--conf', type=float, default=0.25, help='Confidence threshold')
     args = parser.parse_args()
 
     stream_url = args.url or os.environ.get('CAMERA_URL')
     if not stream_url:
-        print("Usage: python scripts/camera_demo.py <camera_url> [--mode outdoor|indoor|vehicles|all]")
-        print("   or: CAMERA_URL=http://host:8080/video python scripts/camera_demo.py")
-        sys.exit(1)
+        parser.error('camera URL required (argument or CAMERA_URL in .env)')
 
     class_filter = CLASS_PRESETS_V2[args.mode]
     mode_name = args.mode.upper()
 
     print(f"Loading models... (mode: {mode_name})")
-
-    detector = create_surveillance_detector(device='cuda')
+    detector = create_surveillance_detector()
     class_names = detector.class_names
-
     tracker = Tracker(max_age=30, min_hits=3, iou_threshold=0.3)
     print("Models loaded")
 
@@ -86,15 +55,14 @@ def main():
 
     print(f"Connecting to {stream_url}")
     cap = cv2.VideoCapture(stream_url)
-
     if not cap.isOpened():
-        print("ERROR: Could not open camera. Is webcam_server.py running on Windows?")
+        print("ERROR: Could not open camera")
         return
 
     print("Press 'q' to quit, 'r' to reset tracks")
 
     frame_times = []
-    track_classes = {}  # track_id -> class_id mapping
+    track_classes = {}
 
     while True:
         ret, frame = cap.read()
@@ -102,48 +70,34 @@ def main():
             continue
 
         start = time.time()
-
-        # Detection
         det_array = detector.detect_array(frame, conf_threshold=args.conf, classes=class_filter)
-        detections = [
-            {'box': det[:4], 'confidence': det[4], 'class_id': int(det[5])}
-            for det in det_array
-        ]
-
-        # Tracking
         tracks = tracker.update(det_array)
 
-        # Update track->class mapping
         for t in tracker.tracks:
-            if t.time_since_update == 0 and len(detections) > 0:
+            if t.time_since_update == 0 and len(det_array) > 0:
                 track_box = t.get_state()
-                for d in detections:
-                    det_box = np.array(d['box'])
-                    if np.allclose(track_box, det_box, atol=50):
-                        track_classes[t.id] = d['class_id']
+                for det in det_array:
+                    if np.allclose(track_box, det[:4], atol=50):
+                        track_classes[t.id] = int(det[5])
                         break
 
-        # Draw
         frame = draw_tracks(frame, tracks, track_classes, class_names)
 
-        # FPS
         frame_times.append(time.time() - start)
         if len(frame_times) > 30:
             frame_times.pop(0)
         fps = len(frame_times) / sum(frame_times)
 
-        # Stats
         cv2.putText(frame, f"FPS: {fps:.1f} | Mode: {mode_name}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Tracks: {len(tracks)}", (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
         cv2.imshow("VisionBox", frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        elif key == ord('r'):
+        if key == ord('r'):
             tracker.reset()
             track_classes.clear()
             print("Tracks reset")

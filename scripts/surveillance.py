@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import socket
 import statistics
@@ -14,40 +15,30 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-sys.path.insert(0, 'src')
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'src'))
 
 from dotenv import load_dotenv
-load_dotenv()
 
+load_dotenv(ROOT / '.env')
 # Time out on stalled RTSP streams so the reconnect logic fires (must precede cv2 use).
 os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp|timeout;5000000')
 
 import cv2
 import numpy as np
 
-from visionbox import (
-    Tracker,
-    CLASS_PRESETS_V2,
-    MotionDetector,
-    merge_overlapping_regions,
-)
-from visionbox.detector_v2 import MultiModelDetector, ModelConfig
-from visionbox.config import load_config, CameraConfig, VisionBoxConfig
+from visionbox import CLASS_PRESETS_V2, MotionDetector, Tracker, merge_overlapping_regions
+from visionbox.api import CamerasState, CameraView, start_api_server
+from visionbox.config import CameraConfig, VisionBoxConfig, load_config
 from visionbox.database import RecordingDatabase
+from visionbox.detector_v2 import ModelConfig, MultiModelDetector
 from visionbox.recording_manager import RecordingManager
-from visionbox.api import (
-    CamerasState, CameraView, start_api_server,
-)
+from visionbox.viz import PLATE_CLASS_ID, box_iou, draw_labeled_box, draw_motion_regions, track_color
 from visionbox.zones import ZoneFilter
-
-
-np.random.seed(42)
-COLORS = [(int(c[0]), int(c[1]), int(c[2])) for c in np.random.randint(0, 255, (100, 3))]
 
 
 def _redact_url(url: str) -> str:
@@ -151,7 +142,6 @@ def start_rss_watchdog(max_rss_mb: int):
 
 
 def open_browser(url: str):
-    import shutil
     for cmd in ['xdg-open', 'cmd.exe']:
         if shutil.which(cmd):
             try:
@@ -163,45 +153,22 @@ def open_browser(url: str):
 
 
 def draw_tracks(image, tracks, track_info, class_names):
-    for track in tracks:
-        x1, y1, x2, y2, track_id = track
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        track_id = int(track_id)
+    for x1, y1, x2, y2, tid in tracks:
+        track_id = int(tid)
         info = track_info.get(track_id)
         if info:
             class_id, class_name, conf = info['class_id'], info['class_name'], info['confidence']
         else:
             class_id, class_name, conf = 0, class_names.get(0, 'unknown'), 0
-        color = COLORS[track_id % len(COLORS)]
-        if class_id == 80:
-            color = (0, 255, 255)
-            label = f"PLATE #{track_id} {conf:.0%}"
-        else:
-            label = f"{class_name} #{track_id} {conf:.0%}"
-        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(image, (x1, y1 - h - 10), (x1 + w, y1), color, -1)
-        cv2.putText(image, label, (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        name = 'PLATE' if class_id == PLATE_CLASS_ID else class_name
+        draw_labeled_box(image, (x1, y1, x2, y2), f"{name} #{track_id} {conf:.0%}",
+                         track_color(track_id, class_id))
     return image
-
-
-def _box_iou(a, b):
-    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
-    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
-    union = area_a + area_b - inter
-    return inter / union if union > 0 else 0
 
 
 def _overlaps_motion(det_box, motion_boxes):
     dx1, dy1, dx2, dy2 = det_box
-    for mx1, my1, mx2, my2 in motion_boxes:
-        if dx1 < mx2 and dx2 > mx1 and dy1 < my2 and dy2 > my1:
-            return True
-    return False
+    return any(dx1 < mx2 and dx2 > mx1 and dy1 < my2 and dy2 > my1 for mx1, my1, mx2, my2 in motion_boxes)
 
 
 class CameraPipeline:
@@ -469,7 +436,7 @@ class CameraPipeline:
                         track_box = t.get_state().flatten()
                         best_iou, best_det = 0, None
                         for det in detections:
-                            iou = _box_iou(track_box, det['box'])
+                            iou = box_iou(track_box, det['box'])
                             if iou > best_iou:
                                 best_iou, best_det = iou, det
                         if best_det and best_iou > 0.3:
@@ -504,9 +471,7 @@ class CameraPipeline:
                 or self.zone_filter.check_required_zones(detections, frame.shape)
             ) if ran_detection else False
 
-            display = frame.copy()
-            for bx1, by1, bx2, by2 in merged_full:
-                cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 0, 255), 1)
+            display = draw_motion_regions(frame.copy(), merged_full)
             display = draw_tracks(display, tracks, self._track_info, self.detector.class_names)
 
             triggered = has_motion and has_moving_objects and in_required_zone
@@ -532,8 +497,7 @@ class CameraPipeline:
             now = time.time()
             frame_captures = []
             for row in tracks:
-                x1, y1, x2, y2, track_id = row
-                track_id = int(track_id)
+                track_id = int(row[4])
                 info = self._track_info.get(track_id)
                 if info is None:
                     continue
@@ -776,18 +740,18 @@ def main():
     print(f"Model loaded ({detector.effective_device})")
 
     pipelines = []
-    for name, cam_cfg in cameras.items():
+    for cam_cfg in cameras.values():
         pipeline = CameraPipeline(cam_cfg, cfg, detector, detector_lock, db)
         pipelines.append(pipeline)
         state.add_camera(pipeline.view, pipeline.zone_filter, pipeline.recording_mgr)
 
     port = cfg.display.web_port
     start_api_server(state, port, cfg.display.bind_host)
-    print(f"\nVisionBox running")
+    print("\nVisionBox running")
     print(f"  Cameras: {', '.join(p.name for p in pipelines)}")
     print(f"  Storage: {output_dir}")
     print(f"  Web UI:  http://0.0.0.0:{port}")
-    print(f"  Press Ctrl+C to stop\n")
+    print("  Press Ctrl+C to stop\n")
 
     for p in pipelines:
         p.start()
