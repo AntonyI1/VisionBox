@@ -6,9 +6,10 @@ tree, records everything in a manifest, and flags the rows `quarantined=1` so th
 dashboard hides them. Fully restorable from the manifest.
 
 Buckets:
-  parked_car_spam     top_label=car and detection_count/duration >= RATIO  (front_garage parked-car re-detection)
-  night_person_review top_label=person between 00:00-05:59                  (night/IR person artifacts — kept for REVIEW)
-  orphan              end_time/duration NULL and older than ORPHAN_MIN min  (stalled/runaway events; skips in-progress)
+  parked_car_spam      top_label=car and detection_count/duration >= RATIO
+                       (front_garage parked-car re-detection)
+  night_person_review  top_label=person between 00:00-05:59 (night/IR person artifacts, kept for REVIEW)
+  orphan               end_time/duration NULL and older than ORPHAN_MIN min (stalled/runaway events)
 
 Usage:
   quarantine_false_positives.py                 # dry-run (counts only)
@@ -17,13 +18,20 @@ Usage:
 """
 import argparse
 import json
+import os
 import shutil
 import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
 
-DB_DEFAULT = '/mnt/storage/visionbox/recordings/visionbox.db'
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / '.env')
+
+STORAGE_DIR = os.environ.get('STORAGE_DIR')
+DB_DEFAULT = f'{STORAGE_DIR}/recordings/visionbox.db' if STORAGE_DIR else None
 RATIO = {'front_garage': 15.0}   # per-camera car det/sec spam cutoff (front_garage is a pure parked-car scene)
 RATIO_DEFAULT = 40.0             # other cams: real traffic peaks ~30, so stay safe
 NIGHT_HOURS = range(0, 6)
@@ -45,7 +53,7 @@ def classify(row: dict) -> str | None:
     if not end or dur is None:
         try:
             age_min = (datetime.now() - datetime.fromisoformat(row['start_time'])).total_seconds() / 60
-        except Exception:
+        except (TypeError, ValueError):
             age_min = ORPHAN_MIN + 1
         return 'orphan' if age_min >= ORPHAN_MIN else None
     thr = RATIO.get(row.get('camera', ''), RATIO_DEFAULT)
@@ -55,7 +63,7 @@ def classify(row: dict) -> str | None:
         try:
             if datetime.fromisoformat(row['start_time']).hour in NIGHT_HOURS:
                 return 'night_person_review'
-        except Exception:
+        except (TypeError, ValueError):
             pass
     return None
 
@@ -96,7 +104,6 @@ def quarantine(db_path: str, apply: bool):
         conn.close()
         return
 
-    # back up the DB
     bak = f"{db_path}.bak-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     shutil.copy2(db_path, bak)
     print(f"\nDB backed up -> {bak}")
@@ -145,7 +152,7 @@ def restore(db_path: str, reason: str | None):
         return
     conn = sqlite3.connect(db_path, timeout=30)
     ensure_columns(conn)
-    entries = [json.loads(l) for l in mpath.read_text().splitlines() if l.strip()]
+    entries = [json.loads(line) for line in mpath.read_text().splitlines() if line.strip()]
     done = 0
     keep = []
     for e in entries:
@@ -174,11 +181,13 @@ def restore(db_path: str, reason: str | None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--db', default=DB_DEFAULT)
+    ap.add_argument('--db', default=DB_DEFAULT, help='events database (default: $STORAGE_DIR/recordings/visionbox.db)')
     ap.add_argument('--apply', action='store_true', help='perform the quarantine (default: dry-run)')
     ap.add_argument('--restore', action='store_true', help='move files back and un-flag rows')
     ap.add_argument('--reason', help='restrict --restore to one bucket (e.g. night_person_review)')
     args = ap.parse_args()
+    if not args.db:
+        sys.exit("STORAGE_DIR is not set (see .env.sample); pass --db explicitly")
     if not Path(args.db).exists():
         sys.exit(f"DB not found: {args.db}")
     if args.restore:
