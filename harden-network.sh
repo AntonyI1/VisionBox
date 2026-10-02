@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # VisionBox network hardening — make host services tailnet-only + cut attack surface.
-#   Review, then run:  sudo bash /home/night/VisionBox/harden-network.sh
+#   Review, then run from the repo root:  sudo bash ./harden-network.sh
 #
 # WHAT THIS DOES (host-level, reversible with `sudo ufw disable`):
 #   * ufw: default-deny inbound / allow outbound; allow loopback; allow the whole
 #     Tailscale interface (trusted tailnet); allow SSH (22) so you are never locked out.
 #     => the VisionBox dashboard (host process on :8085) becomes reachable ONLY over
-#        Tailscale (+ localhost), on top of the HTTP Basic auth already enabled.
+#        Tailscale (+ localhost), on top of the dashboard login already enabled.
 #   * Disables rpcbind (port 111): the NFS mount is v4.2 (single TCP port, client-
 #     initiated), so rpcbind is not needed — closing it removes a needless surface.
 #
-# NOT done here (they touch Frigate/Docker or need a choice) — see the notes at the end.
+# NOT done here: Frigate's Docker-published ports bypass ufw — see harden-frigate.sh.
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo: sudo bash $0"; exit 1; }
 
@@ -34,24 +34,25 @@ if systemctl is-active --quiet rpcbind || systemctl is-enabled --quiet rpcbind 2
   echo "rpcbind disabled (NFS is v4.2; does not need it)."
 fi
 
-cat <<'NOTES'
+# This host's addresses, for the copy-pasteable checks below (placeholders if unknown).
+LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}' || true)
+TS_IP=$(tailscale ip -4 2>/dev/null | head -n1 || true)
+cat <<NOTES
 
---- DONE: host services are now tailnet-only (+ dashboard auth). ---
+--- DONE: host services are now tailnet-only (+ dashboard login). ---
 
 VERIFY from a LAN device that is NOT on Tailscale — the dashboard must NOT load:
-    curl --max-time 4 http://192.168.1.252:8085/        # expect: hang / connection refused
-On Tailscale it should prompt for the dashboard password.
+    curl --max-time 4 http://${LAN_IP:-<lan-ip>}:8085/        # expect: hang / connection refused
+Over Tailscale (http://${TS_IP:-<tailscale-ip>}:8085/) it should show the dashboard login page.
 
 STILL TO DO (manual — not done automatically):
   1. Frigate's :5000/:8554/:8555 are published by DOCKER, which BYPASSES ufw.
-     To make Frigate tailnet-only, bind its compose ports to the Tailscale IP:
+     Run harden-frigate.sh to filter them in the DOCKER-USER chain (tailnet-only).
+     Alternative: bind the compose ports to the Tailscale IP instead, e.g.
          ports:
-           - "100.78.228.85:5000:5000"
-           - "100.78.228.85:8554:8554"
-           - "100.78.228.85:8555:8555/tcp"
-           - "100.78.228.85:8555:8555/udp"
-     then re-create:  docker compose up -d   (keeps frigate.antonyibrahim.com working over Tailscale)
+           - "${TS_IP:-<tailscale-ip>}:5000:5000"
+     then re-create with: docker compose up -d
   2. Optional SSH brute-force protection:
          sudo apt-get install -y fail2ban && sudo systemctl enable --now fail2ban
-  3. Confirm your home router has NO port-forward to 192.168.1.252 (esp. 8085 / 5000 / 22).
+  3. Confirm your home router has NO port-forward to this host (${LAN_IP:-<lan-ip>}; esp. 8085 / 5000 / 22).
 NOTES

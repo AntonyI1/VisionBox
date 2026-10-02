@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VisionBox network hardening, part 2 — make Frigate's Docker ports tailnet-only.
-#   Review, then run:  sudo bash /home/night/VisionBox/harden-frigate.sh
+#   Review, then run from the repo root:  sudo bash ./harden-frigate.sh
 #
 # PROBLEM: Docker publishes Frigate's 5000 (UI, no auth) / 8554 (RTSP) / 8555 (WebRTC)
 # on 0.0.0.0 and DNATs traffic in the FORWARD path, which BYPASSES ufw's INPUT rules —
@@ -47,16 +47,20 @@ fi
 ufw reload
 echo
 iptables -L DOCKER-USER -n --line-numbers
-cat <<'NOTES'
+
+# This host's addresses, for the copy-pasteable checks below (placeholders if unknown).
+LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}' || true)
+TS_IP=$(tailscale ip -4 2>/dev/null | head -n1 || true)
+cat <<NOTES
 
 --- DONE: Frigate (5000/8554/8555) is now tailnet-only. ---
 
 VERIFY from a LAN device that is NOT on Tailscale — Frigate must NOT load:
-    curl --max-time 4 http://192.168.1.252:5000/        # expect: timeout
+    curl --max-time 4 http://${LAN_IP:-<lan-ip>}:5000/        # expect: timeout
 Over Tailscale it must still work:
-    curl --max-time 4 http://100.78.228.85:5000/        # expect: HTML
+    curl --max-time 4 http://${TS_IP:-<tailscale-ip>}:5000/        # expect: HTML
 And VisionBox itself must still see its feeds (uses 127.0.0.1, unaffected):
     curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8085/   # expect: 401
 
-ROLLBACK: restore the .bak file over /etc/ufw/after.rules and `ufw reload`.
+ROLLBACK: restore the .bak file over /etc/ufw/after.rules, then: ufw reload
 NOTES
