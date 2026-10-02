@@ -6,8 +6,9 @@
 # whenever the base-class regression gate passes.
 set -uo pipefail
 
-cd /home/night/VisionBox
-PY=/home/night/VisionBox/venv/bin/python
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+PY="$ROOT/venv/bin/python"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 # Refresh the COCO-replay regression set (idempotent; needs internet the first time).

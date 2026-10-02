@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
-"""Assisted-labelling CLI for the VisionBox review queue.
+"""Assisted labelling for the VisionBox review queue.
 
-Walks /mnt/storage/visionbox/datasets/review/<camera>, draws each prelabel over
-its frame and lets a human accept / drop / reclass boxes or discard the frame.
-Accepted frames (with any in-session edits applied) are emitted to
-/mnt/storage/visionbox/datasets/corrected/<camera>/{images,labels} where
-assemble_dataset.py ingests them. Labels stay in RAW COCO id space.
+Walks $STORAGE_DIR/datasets/review/<camera>, draws each prelabel over its frame and lets a
+human accept / drop / reclass boxes or discard the frame. Accepted frames are written to
+$STORAGE_DIR/datasets/corrected/<camera>/{images,labels}, where assemble_dataset.py picks
+them up. Labels stay in raw COCO id space.
 
-Interactive keys:
-    a  accept frame (write img + edited label to corrected/)
-    d  delete frame and its .jpg/.txt/.json sidecars from the review queue
-    e  cycle the selected box's class id
-    x  drop the selected box
-    n / p  select next / previous box
-    s  skip frame
-    q  quit (cursor is persisted)
+Keys:
+    a  accept frame        d  delete frame and its sidecars    s  skip frame
+    e  cycle box class     x  drop box     n / p  next / previous box
+    q  quit (cursor persisted)
 
-Headless: --headless --min-conf X auto-accepts every frame whose prelabel
-confidences (from the sidecar .json) all exceed X, with no GUI.
+--headless --min-conf X auto-accepts every frame whose prelabel confidences all exceed X.
 """
 
 import argparse
@@ -26,18 +20,19 @@ import os
 import shutil
 import sys
 
-REVIEW_ROOT = "/mnt/storage/visionbox/datasets/review"
-CORRECTED_ROOT = "/mnt/storage/visionbox/datasets/corrected"
+import cv2
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+
+import assemble_dataset
+
+REVIEW_ROOT = assemble_dataset.REVIEW_ROOT
+CORRECTED_ROOT = assemble_dataset.CORRECTED_ROOT
 CURSOR_PATH = os.path.join(REVIEW_ROOT, ".correct_cursor.json")
 
 WINDOW = "VisionBox correct_labels"
 IMG_EXTS = (".jpg", ".jpeg", ".png")
-
-
-def _coco_names():
-    from ultralytics import YOLO
-
-    return dict(YOLO("/home/night/VisionBox/yolov8n.pt").names)
 
 
 def _list_cameras():
@@ -97,10 +92,7 @@ def _load_confidences(camera, stem):
 
 
 def _write_boxes(path, boxes):
-    lines = [
-        "{} {:.6f} {:.6f} {:.6f} {:.6f}".format(int(c), cx, cy, w, h)
-        for c, cx, cy, w, h in boxes
-    ]
+    lines = [f"{int(c)} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}" for c, cx, cy, w, h in boxes]
     with open(path, "w") as fh:
         fh.write("\n".join(lines))
         if lines:
@@ -120,7 +112,7 @@ def _accept(camera, stem, boxes):
 
 def _delete(camera, stem):
     cam_dir = os.path.join(REVIEW_ROOT, camera)
-    for ext in IMG_EXTS + (".txt", ".json"):
+    for ext in (*IMG_EXTS, ".txt", ".json"):
         p = os.path.join(cam_dir, stem + ext)
         if os.path.isfile(p):
             os.remove(p)
@@ -143,7 +135,7 @@ def _save_cursor(camera, index):
     os.replace(tmp, CURSOR_PATH)
 
 
-def _draw(cv2, image, names, boxes, confs, selected, info):
+def _draw(image, names, boxes, confs, selected, info):
     canvas = image.copy()
     h, w = canvas.shape[:2]
     for i, (cls, cx, cy, bw, bh) in enumerate(boxes):
@@ -157,7 +149,7 @@ def _draw(cv2, image, names, boxes, confs, selected, info):
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness)
         label = names.get(int(cls), str(int(cls)))
         if i < len(confs) and confs[i] is not None:
-            label += " {:.2f}".format(confs[i])
+            label += f" {confs[i]:.2f}"
         cv2.putText(canvas, label, (x1, max(0, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     cv2.putText(canvas, info, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
@@ -167,12 +159,6 @@ def _draw(cv2, image, names, boxes, confs, selected, info):
 
 
 def run_interactive(camera, names):
-    try:
-        import cv2
-    except ImportError:
-        print("[correct_labels] opencv is not installed.", file=sys.stderr)
-        return 1
-
     frames = _list_frames(camera)
     if not frames:
         print(f"[correct_labels] no reviewable frames for camera '{camera}'.")
@@ -211,7 +197,7 @@ def run_interactive(camera, names):
             continue
 
         info = f"{camera}  {i + 1}/{len(frames)}  boxes={len(boxes)}"
-        cv2.imshow(WINDOW, _draw(cv2, img, names, boxes, confs, selected, info))
+        cv2.imshow(WINDOW, _draw(img, names, boxes, confs, selected, info))
         key = cv2.waitKey(0) & 0xFF
 
         if key in (ord("q"), 27):
@@ -275,6 +261,7 @@ def main():
                         help="Headless confidence threshold (all boxes must exceed it).")
     args = parser.parse_args()
 
+    assemble_dataset.require_storage_dir()
     os.makedirs(CORRECTED_ROOT, exist_ok=True)
 
     if args.headless:
@@ -283,7 +270,7 @@ def main():
     if not args.camera:
         parser.error("--camera is required for interactive mode (or pass --headless).")
 
-    return run_interactive(args.camera, _coco_names())
+    return run_interactive(args.camera, assemble_dataset.coco_names())
 
 
 if __name__ == "__main__":

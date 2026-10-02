@@ -1,20 +1,40 @@
+#!/usr/bin/env python3
+"""Assemble the trainable YOLO dataset from VisionBox's auto-labelled frames.
+
+Pairs every label with its image across the capture, review and corrected trees, drops
+malformed labels, keeps a frozen validation split and emits
+$STORAGE_DIR/datasets/yolo/{images,labels,data.yaml} as symlinks into the source trees.
+
+    assemble_dataset.py [--dry-run]
+"""
+
 import argparse
 import os
 import random
+import sys
 from collections import Counter
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
-BASE_WEIGHTS = "/home/night/VisionBox/yolov8n.pt"
-YOLO_ROOT = Path("/mnt/storage/visionbox/datasets/yolo")
+ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT / ".env")
+
+BASE_WEIGHTS = ROOT / "yolov8n.pt"
+STORAGE_DIR = Path(os.environ.get("STORAGE_DIR", ""))  # validated by require_storage_dir()
+
+YOLO_ROOT = STORAGE_DIR / "datasets" / "yolo"
 CUSTOM_CLASSES_YAML = YOLO_ROOT / "classes_custom.yaml"
 SPLIT_FILE = YOLO_ROOT / "splits" / "val_frozen.txt"
-COCO_REPLAY_IMAGES = "/mnt/storage/visionbox/datasets/coco_replay/images"
+COCO_REPLAY_ROOT = STORAGE_DIR / "datasets" / "coco_replay"
+COCO_REPLAY_IMAGES = COCO_REPLAY_ROOT / "images"
+COCO_REPLAY_LABELS = COCO_REPLAY_ROOT / "labels"
+COCO_REPLAY_YAML = COCO_REPLAY_ROOT / "base.yaml"
 
-CAPTURES_ROOT = Path("/mnt/storage/visionbox/captures/dataset")
-REVIEW_ROOT = Path("/mnt/storage/visionbox/datasets/review")
-CORRECTED_ROOT = Path("/mnt/storage/visionbox/datasets/corrected")
+CAPTURES_ROOT = STORAGE_DIR / "captures" / "dataset"
+REVIEW_ROOT = STORAGE_DIR / "datasets" / "review"
+CORRECTED_ROOT = STORAGE_DIR / "datasets" / "corrected"
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 VAL_FRACTION = 0.20
@@ -25,6 +45,17 @@ SOURCES = (
     ("review", REVIEW_ROOT),
     ("corrected", CORRECTED_ROOT),
 )
+
+
+def require_storage_dir():
+    if not os.environ.get("STORAGE_DIR"):
+        sys.exit("STORAGE_DIR is not set: copy .env.sample to .env and point it at the storage root")
+
+
+def coco_names():
+    from ultralytics import YOLO
+
+    return {int(k): v for k, v in YOLO(str(BASE_WEIGHTS)).names.items()}
 
 
 def _find_image(directory, stem):
@@ -63,10 +94,9 @@ def load_pairs():
                         continue
                 except OSError:
                     continue
-                key = f"{source_name}-{camera}__{stem}"
                 pairs.append(
                     {
-                        "key": key,
+                        "key": f"{source_name}-{camera}__{stem}",
                         "source": source_name,
                         "camera": camera,
                         "image": image_path,
@@ -82,13 +112,10 @@ def validate_label(line, nc):
         return None
     try:
         class_id = int(parts[0])
+        coords = [float(x) for x in parts[1:]]
     except ValueError:
         return None
     if class_id < 0 or class_id >= nc:
-        return None
-    try:
-        coords = [float(x) for x in parts[1:]]
-    except ValueError:
         return None
     if any(not (0.0 <= v <= 1.0) for v in coords):
         return None
@@ -96,34 +123,21 @@ def validate_label(line, nc):
 
 
 def read_valid_label(label_path, nc):
-    valid = []
-    classes = []
+    """Normalised valid lines of a label file, or None if it has none."""
     try:
         raw = label_path.read_text()
     except OSError:
-        return None, classes
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        result = validate_label(line, nc)
-        if result is None:
-            continue
-        class_id, normalized = result
-        classes.append(class_id)
-        valid.append(normalized)
-    if not valid:
-        return None, classes
-    return valid, classes
+        return None
+    valid = []
+    for raw_line in raw.splitlines():
+        result = validate_label(raw_line.strip(), nc)
+        if result is not None:
+            valid.append(result[1])
+    return valid or None
 
 
 def build_class_names():
-    from ultralytics import YOLO
-
-    names = dict(YOLO(BASE_WEIGHTS).names)
-    names = {int(k): v for k, v in names.items()}
-    max_id = max(names) if names else -1
-
+    names = coco_names()
     if CUSTOM_CLASSES_YAML.is_file():
         with open(CUSTOM_CLASSES_YAML) as f:
             doc = yaml.safe_load(f) or {}
@@ -134,24 +148,20 @@ def build_class_names():
         elif isinstance(custom, list):
             for offset, name in enumerate(custom):
                 names[80 + offset] = name
-        max_id = max(names) if names else -1
-
-    nc = max(80, max_id + 1)
+    nc = max(80, max(names) + 1) if names else 80
     return names, nc
 
 
-def frozen_split(keys):
+def frozen_split(keys, write=True):
+    """Validation keys: previously frozen ones first, topped up deterministically to VAL_FRACTION."""
     keys = list(keys)
     key_set = set(keys)
-    SPLIT_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    existing = []
+    val_keys = set()
     if SPLIT_FILE.is_file():
         for line in SPLIT_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and line in key_set:
-                existing.append(line)
-    val_keys = set(existing)
+            key = line.strip()
+            if key and key in key_set:
+                val_keys.add(key)
 
     target = round(len(keys) * VAL_FRACTION)
     if len(val_keys) < target:
@@ -162,7 +172,9 @@ def frozen_split(keys):
                 break
             val_keys.add(k)
 
-    SPLIT_FILE.write_text("\n".join(sorted(val_keys)) + "\n")
+    if write:
+        SPLIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SPLIT_FILE.write_text("\n".join(sorted(val_keys)) + "\n")
     return val_keys
 
 
@@ -170,25 +182,25 @@ def _relink(target, link_path):
     link_path.parent.mkdir(parents=True, exist_ok=True)
     if link_path.is_symlink() or link_path.exists():
         link_path.unlink()
-    rel = os.path.relpath(target, link_path.parent)
-    link_path.symlink_to(rel)
+    link_path.symlink_to(os.path.relpath(target, link_path.parent))
 
 
 def emit(dry_run=False):
+    require_storage_dir()
     names, nc = build_class_names()
     pairs = load_pairs()
 
     kept = []
     class_counts = Counter()
     for pair in pairs:
-        valid, _ = read_valid_label(pair["label"], nc)
+        valid = read_valid_label(pair["label"], nc)
         if valid is None:
             continue
         pair["lines"] = valid
         kept.append(pair)
         class_counts.update(int(line.split()[0]) for line in valid)
 
-    val_keys = frozen_split([p["key"] for p in kept])
+    val_keys = frozen_split([p["key"] for p in kept], write=not dry_run)
 
     split_counts = {"train": 0, "val": 0}
     img_train = YOLO_ROOT / "images" / "train"
@@ -198,9 +210,10 @@ def emit(dry_run=False):
 
     if not dry_run:
         for d in (img_train, img_val, lbl_train, lbl_val):
-            for old in d.glob("*") if d.is_dir() else ():
-                if old.is_symlink():
-                    old.unlink()
+            if d.is_dir():
+                for old in d.glob("*"):
+                    if old.is_symlink():
+                        old.unlink()
             d.mkdir(parents=True, exist_ok=True)
 
     for pair in kept:
@@ -210,28 +223,24 @@ def emit(dry_run=False):
             continue
         img_dir = img_val if is_val else img_train
         lbl_dir = lbl_val if is_val else lbl_train
-        img_link = img_dir / f"{pair['key']}{pair['image'].suffix}"
-        lbl_link = lbl_dir / f"{pair['key']}.txt"
-        _relink(pair["image"], img_link)
-        norm = lbl_link.with_suffix(".txt")
-        norm.parent.mkdir(parents=True, exist_ok=True)
-        norm.write_text("\n".join(pair["lines"]) + "\n")
+        _relink(pair["image"], img_dir / f"{pair['key']}{pair['image'].suffix}")
+        (lbl_dir / f"{pair['key']}.txt").write_text("\n".join(pair["lines"]) + "\n")
 
     data_yaml = YOLO_ROOT / "data.yaml"
     if not dry_run:
         doc = {
             "path": str(YOLO_ROOT),
-            "train": ["images/train", COCO_REPLAY_IMAGES],
+            "train": ["images/train", str(COCO_REPLAY_IMAGES)],
             "val": "images/val",
             "nc": nc,
             "names": {int(k): names[k] for k in sorted(names)},
         }
-        YOLO_ROOT.mkdir(parents=True, exist_ok=True)
         with open(data_yaml, "w") as f:
             yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
 
     return {
         "data_yaml": str(data_yaml),
+        "names": names,
         "n_train": split_counts["train"],
         "n_val": split_counts["val"],
         "nc": nc,
@@ -241,18 +250,17 @@ def emit(dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Assemble the trainable YOLO dataset from orphaned VisionBox labels."
+        description="Assemble the trainable YOLO dataset from VisionBox's labelled frames."
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Compute and print counts without materialising symlinks or data.yaml.",
+        help="Print the counts without writing the split, symlinks, labels or data.yaml.",
     )
     args = parser.parse_args()
 
-    YOLO_ROOT.mkdir(parents=True, exist_ok=True)
-    names, _ = build_class_names()
     result = emit(dry_run=args.dry_run)
+    names = result["names"]
 
     print(f"mode:        {'dry-run' if args.dry_run else 'write'}")
     print(f"data.yaml:   {result['data_yaml']}")

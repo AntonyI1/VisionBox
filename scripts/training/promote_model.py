@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""Atomic model hot-swap and rollback for VisionBox.
+"""Atomic model hot-swap and rollback for the live VisionBox detector.
 
-promote(run_dir) copies the freshly exported OpenVINO model into a DURABLE slot
-under models/, repoints the active-model symlink at it, and asks the live
-detector to hot-swap via SIGHUP. rollback() restores whatever target was active
-before the last promote.
+promote(run_dir) copies the run's OpenVINO export into a durable slot under models/
+(the active link never points into the volatile runs/ tree), repoints the
+models/yolov8n_openvino_model symlink atomically and SIGHUPs visionbox.service, which
+rebuilds the model under its lock and swaps it in without dropping a stream.
+rollback() restores whatever was active before the last promote.
 
-Design choices that keep live surveillance safe:
-  * The active link (models/yolov8n_openvino_model) is NEVER pointed into the
-    volatile runs/train tree — we copy the export into models/ first, so a later
-    cleanup of runs/ can't dangle the live model.
-  * Reload is via SIGHUP (an on-box signal needing no auth); the service rebuilds
-    the model under its lock, pausing the cameras for a single frame, not a whole
-    restart. We never auto-restart the service (that would drop every stream).
+    promote_model.py runs/train/overnight_<ts>
+    promote_model.py --rollback
 """
+
 import argparse
 import os
 import shutil
 import signal
 import subprocess
 import sys
+from pathlib import Path
 
-MODELS_DIR = "/home/night/VisionBox/models"
+ROOT = Path(__file__).resolve().parents[2]
+MODELS_DIR = os.path.join(ROOT, "models")
 ACTIVE_LINK = os.path.join(MODELS_DIR, "yolov8n_openvino_model")
 CANDIDATE_LINK = os.path.join(MODELS_DIR, "candidate")
 PREV_ACTIVE = os.path.join(MODELS_DIR, ".prev_active")
@@ -29,43 +28,28 @@ SERVICE = "visionbox.service"
 
 
 def find_export(run_dir=None):
-    """Return the *_openvino_model directory to promote.
-
-    Looks under run_dir first, then falls back to the staged candidate link.
-    """
-    search_roots = []
-    if run_dir:
-        search_roots.append(run_dir)
-    search_roots.append(CANDIDATE_LINK)
-
-    for root in search_roots:
-        if not root:
+    """Return the *_openvino_model directory under run_dir, else the staged candidate."""
+    for search_root in filter(None, (run_dir, CANDIDATE_LINK)):
+        base = os.path.realpath(search_root)
+        if not os.path.exists(base):
             continue
-        root = os.path.abspath(root)
-        if not os.path.exists(root):
-            continue
-        if os.path.isdir(root) and root.endswith("_openvino_model"):
-            return root
-        for dirpath, dirnames, _ in os.walk(root):
+        if os.path.isdir(base) and base.endswith("_openvino_model"):
+            return base
+        for dirpath, dirnames, _ in os.walk(base):
             for d in sorted(dirnames):
                 if d.endswith("_openvino_model"):
                     return os.path.join(dirpath, d)
-    raise FileNotFoundError(
-        "No *_openvino_model directory found under %s"
-        % (run_dir or CANDIDATE_LINK)
-    )
+    raise FileNotFoundError(f"No *_openvino_model directory found under {run_dir or CANDIDATE_LINK}")
 
 
 def _materialize(export_dir, run_dir=None):
-    """Copy the export into a durable models/ slot so the active link never depends
-    on the volatile runs/train tree. Idempotent if the export already lives under
-    models/. Returns the durable path."""
+    """Copy the export into a durable models/ slot; a no-op if it already lives there."""
     export_dir = os.path.abspath(export_dir)
     models_abs = os.path.abspath(MODELS_DIR)
     if export_dir == models_abs or export_dir.startswith(models_abs + os.sep):
-        return export_dir  # already durable (e.g. the base model itself)
+        return export_dir
     tag = os.path.basename(os.path.normpath(run_dir)) if run_dir else os.path.basename(export_dir)
-    slot = os.path.join(MODELS_DIR, "%s_openvino_model" % tag)
+    slot = os.path.join(MODELS_DIR, f"{tag}_openvino_model")
     # Never overwrite the currently-active model dir while copying.
     if os.path.realpath(slot) == os.path.realpath(ACTIVE_LINK):
         slot += ".new"
@@ -76,12 +60,10 @@ def _materialize(export_dir, run_dir=None):
 
 
 def _atomic_symlink(target, link_path):
-    """Point link_path at target atomically via temp symlink + os.replace."""
-    target = os.path.abspath(target)
-    tmp = link_path + ".tmp.%d" % os.getpid()
+    tmp = f"{link_path}.tmp.{os.getpid()}"
     if os.path.lexists(tmp):
         os.remove(tmp)
-    os.symlink(target, tmp)
+    os.symlink(os.path.abspath(target), tmp)
     os.replace(tmp, link_path)
 
 
@@ -99,27 +81,17 @@ def _record_prev_active():
 
 
 def _reload():
-    """Hot-swap the new model into the live detector by SIGHUP-ing the service.
-
-    The service's handler rebuilds the model under its lock (cameras pause for a
-    single frame, not the whole rebuild). We deliberately do NOT auto-restart the
-    service — that would drop every camera stream — so on failure we just print how
-    to reload manually.
-    """
+    """SIGHUP the service for an in-place hot-swap; a restart would drop every camera stream."""
     try:
-        out = subprocess.run(
-            ["systemctl", "show", SERVICE, "-p", "MainPID", "--value"],
-            capture_output=True, text=True, timeout=5,
-        )
+        out = subprocess.run(["systemctl", "show", SERVICE, "-p", "MainPID", "--value"],
+                             capture_output=True, text=True, timeout=5, check=False)
         pid = out.stdout.strip()
         if pid.isdigit() and int(pid) > 0:
             os.kill(int(pid), signal.SIGHUP)
             return "sighup"
-    except (subprocess.SubprocessError, ProcessLookupError, PermissionError,
-            OSError, ValueError) as exc:
-        print("SIGHUP reload failed (%s)" % exc)
-    print("WARN: could not signal %s; reload manually with: "
-          "sudo systemctl reload-or-restart %s" % (SERVICE, SERVICE))
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        print(f"SIGHUP reload failed ({exc})")
+    print(f"WARN: could not signal {SERVICE}; reload manually with: sudo systemctl reload-or-restart {SERVICE}")
     return "manual"
 
 
@@ -129,27 +101,27 @@ def promote(run_dir=None):
     durable = _materialize(export_dir, run_dir)
     prev = _record_prev_active()
     if prev and os.path.realpath(durable) == os.path.realpath(prev):
-        print("model %s already active; nothing to promote" % durable)
+        print(f"model {durable} already active; nothing to promote")
         return durable
     _atomic_symlink(durable, ACTIVE_LINK)
     method = _reload()
-    print("promoted %s -> %s (reload via %s)" % (durable, ACTIVE_LINK, method))
+    print(f"promoted {durable} -> {ACTIVE_LINK} (reload via {method})")
     return durable
 
 
 def rollback():
     """Restore the model target recorded before the last promote."""
     if not os.path.exists(PREV_ACTIVE):
-        raise FileNotFoundError("no %s to roll back to" % PREV_ACTIVE)
+        raise FileNotFoundError(f"no {PREV_ACTIVE} to roll back to")
     with open(PREV_ACTIVE) as fh:
         prev = fh.read().strip()
     if not prev:
-        raise ValueError("%s is empty; nothing to roll back to" % PREV_ACTIVE)
+        raise ValueError(f"{PREV_ACTIVE} is empty; nothing to roll back to")
     if not os.path.exists(prev):
-        raise FileNotFoundError("previous model %s no longer exists" % prev)
+        raise FileNotFoundError(f"previous model {prev} no longer exists")
     _atomic_symlink(prev, ACTIVE_LINK)
     method = _reload()
-    print("rolled back to %s (reload via %s)" % (prev, method))
+    print(f"rolled back to {prev} (reload via {method})")
     return prev
 
 

@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Freeze a fixed COCO-replay set to fight catastrophic forgetting.
+"""Freeze a fixed COCO-replay set so the regression gate can catch catastrophic forgetting.
 
-The replay set is a small, stable slice of base-model (COCO 80-class) frames
-with their YOLO labels (raw COCO ids 0-79). The overnight regression gate
-re-validates the candidate weights against this set so domain adaptation on the
-camera footage cannot silently destroy base-class accuracy.
+Copies up to --limit labelled coco128 images (auto-downloaded by Ultralytics when online)
+into $STORAGE_DIR/datasets/coco_replay/{images,labels} and writes base.yaml beside them;
+train_overnight.py re-validates every candidate against this set before staging it.
+Offline, fill the same layout by hand with at least MIN_REPLAY_IMAGES frames whose labels
+use raw COCO ids 0-79.
 
-Output layout (SHARED CONTRACT):
-    /mnt/storage/visionbox/datasets/coco_replay/
-        images/*.jpg
-        labels/*.txt        # COCO ids 0-79
-        base.yaml           # path/val -> images, names = COCO 0-79
+    prep_replay.py [--limit 128] [--force]
 """
 
 import argparse
@@ -18,43 +15,18 @@ import os
 import shutil
 import sys
 
-REPLAY_ROOT = "/mnt/storage/visionbox/datasets/coco_replay"
-IMAGES_DIR = os.path.join(REPLAY_ROOT, "images")
-LABELS_DIR = os.path.join(REPLAY_ROOT, "labels")
-BASE_YAML = os.path.join(REPLAY_ROOT, "base.yaml")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+
+import assemble_dataset
+
+REPLAY_ROOT = assemble_dataset.COCO_REPLAY_ROOT
+IMAGES_DIR = assemble_dataset.COCO_REPLAY_IMAGES
+LABELS_DIR = assemble_dataset.COCO_REPLAY_LABELS
+BASE_YAML = assemble_dataset.COCO_REPLAY_YAML
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 MIN_REPLAY_IMAGES = 64
-
-# Offline fallback (NO network / coco128 unavailable):
-# ----------------------------------------------------------------------------
-# Curate ~150 high-confidence base-model frames as pseudo-label replay instead.
-# Run the current active model over a pool of camera/general frames, keep only
-# detections with conf >= 0.85, and write them in YOLO format with RAW COCO ids:
-#
-#   from visionbox.detector_v2 import load_active
-#   model = load_active()
-#   for img in sorted(glob.glob("<pool>/*.jpg"))[:150]:
-#       res = model(img, conf=0.85, verbose=False)[0]
-#       lines = []
-#       for b in res.boxes:
-#           cls = int(b.cls)                      # already a COCO id 0-79
-#           x, y, w, h = b.xywhn[0].tolist()      # normalised cx,cy,w,h
-#           lines.append(f"{cls} {x:.6f} {y:.6f} {w:.6f} {h:.6f}")
-#       shutil.copy2(img, IMAGES_DIR)
-#       write(os.path.join(LABELS_DIR, stem + ".txt"), "\n".join(lines))
-#
-# Then write base.yaml exactly as _write_base_yaml() does below. Pseudo-labels
-# are weaker than coco128's human labels, so prefer the online path whenever a
-# network is available.
-# ----------------------------------------------------------------------------
-
-
-def _coco_names():
-    """COCO 80-class id->name mapping straight from the base weights."""
-    from ultralytics import YOLO
-
-    return dict(YOLO("/home/night/VisionBox/yolov8n.pt").names)
 
 
 def _img2label(img_path):
@@ -64,8 +36,7 @@ def _img2label(img_path):
         base = img_path.rsplit(sep, 1)[0] + f"{os.sep}labels{os.sep}" + img_path.rsplit(sep, 1)[1]
     else:
         base = img_path
-    stem = os.path.splitext(base)[0]
-    return stem + ".txt"
+    return os.path.splitext(base)[0] + ".txt"
 
 
 def _list_images(directory):
@@ -88,7 +59,7 @@ def _source_images():
         src = src[0]
     if src and os.path.isfile(src):
         src = os.path.dirname(src)
-    names = data.get("names") or _coco_names()
+    names = data.get("names") or assemble_dataset.coco_names()
     return src, dict(names)
 
 
@@ -102,17 +73,13 @@ def _write_base_yaml(names):
         f"nc: {len(names)}",
         "names:",
     ]
-    for idx in sorted(names):
-        lines.append(f"  {idx}: {names[idx]}")
+    lines.extend(f"  {idx}: {names[idx]}" for idx in sorted(names))
     with open(BASE_YAML, "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
 
 def _is_populated():
-    return (
-        os.path.isfile(BASE_YAML)
-        and len(_list_images(IMAGES_DIR)) >= MIN_REPLAY_IMAGES
-    )
+    return os.path.isfile(BASE_YAML) and len(_list_images(IMAGES_DIR)) >= MIN_REPLAY_IMAGES
 
 
 def main():
@@ -121,6 +88,7 @@ def main():
     parser.add_argument("--limit", type=int, default=128, help="Max images to freeze.")
     args = parser.parse_args()
 
+    assemble_dataset.require_storage_dir()
     os.makedirs(IMAGES_DIR, exist_ok=True)
     os.makedirs(LABELS_DIR, exist_ok=True)
 
@@ -136,11 +104,8 @@ def main():
 
     src_dir, names = _source_images()
     if not src_dir or not os.path.isdir(src_dir):
-        print(
-            "[prep_replay] could not obtain coco128 images. If offline, use the "
-            "pseudo-label fallback documented at the top of this file.",
-            file=sys.stderr,
-        )
+        print("[prep_replay] could not obtain coco128 images; offline, fill the replay layout by hand "
+              "(see the module docstring).", file=sys.stderr)
         return 1
 
     images = _list_images(src_dir)[: max(1, args.limit)]
@@ -154,11 +119,8 @@ def main():
         copied += 1
 
     if copied < MIN_REPLAY_IMAGES:
-        print(
-            f"[prep_replay] only {copied} labelled images found (< {MIN_REPLAY_IMAGES}); "
-            "replay set too small to be a reliable regression gate.",
-            file=sys.stderr,
-        )
+        print(f"[prep_replay] only {copied} labelled images found (< {MIN_REPLAY_IMAGES}); "
+              "replay set too small to be a reliable regression gate.", file=sys.stderr)
         return 1
 
     _write_base_yaml(names)
