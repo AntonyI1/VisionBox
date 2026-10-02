@@ -8,18 +8,19 @@ import re
 import shutil
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, request, send_file, abort, session, redirect
+from flask import Flask, Response, abort, jsonify, redirect, request, send_file, session
 
 from .database import RecordingDatabase
 from .recording_manager import RecordingManager
-from .zones import ZoneFilter, Zone
+from .zones import Zone, ZoneFilter
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 # only detects a vanished client on the next write, so without this an unbounded wait on
 # a stalled/offline camera would leak the worker thread + its stream_clients slot.
 _STREAM_KEEPALIVE_S = 2.0
+
+_IMAGE_SUFFIXES = ('.jpg', '.jpeg', '.png')
 
 
 _LOGIN_PAGE = """<!doctype html>
@@ -55,7 +58,8 @@ _LOGIN_PAGE = """<!doctype html>
   .brand small { color:#9d8f7c; font-size:12px; }
   label { display:block; font-size:12px; color:#a2937f; margin:15px 0 6px; font-weight:500; }
   input { width:100%; min-height:44px; padding:11px 12px; background:#1a1510; border:1px solid #3a3229;
-          border-radius:9px; color:#ece3d6; font-size:14px; outline:none; transition:border-color .15s,background .15s; }
+          border-radius:9px; color:#ece3d6; font-size:14px; outline:none;
+          transition:border-color .15s,background .15s; }
   input:focus { border-color:#cda06d; background:#1f1a13; }
   button { width:100%; min-height:44px; margin-top:24px; padding:12px; background:#cda06d; color:#221a12; border:0;
            border-radius:9px; font-size:14px; font-weight:600; cursor:pointer; transition:background .15s; }
@@ -70,7 +74,8 @@ _LOGIN_PAGE = """<!doctype html>
     <label for="u">Username</label>
     <input id="u" name="username" value="__USER__" autocomplete="username">
     <label for="p">Password</label>
-    <input id="p" name="password" type="password" placeholder="Enter password" autofocus autocomplete="current-password">
+    <input id="p" name="password" type="password" placeholder="Enter password" autofocus
+           autocomplete="current-password">
     <button type="submit">Sign in</button>
     <div class="err">__ERROR__</div>
     <div class="foot">Tailscale-only · household access</div>
@@ -218,38 +223,29 @@ def create_app(state: CamerasState) -> Flask:
             return zf
         return state.zone_filters[name]
 
+    def _web_file(*parts: str, mimetype: str) -> Response:
+        return send_file(os.path.join(app.static_folder, *parts), mimetype=mimetype)
+
     @app.route('/')
     def index():
-        return send_file(
-            os.path.join(app.static_folder, 'index.html'),
-            mimetype='text/html',
-        )
+        return _web_file('index.html', mimetype='text/html')
 
     # ----- PWA (manifest + service worker at root scope) -----
 
     @app.route('/manifest.webmanifest')
     def manifest():
-        return send_file(
-            os.path.join(app.static_folder, 'manifest.webmanifest'),
-            mimetype='application/manifest+json',
-        )
+        return _web_file('manifest.webmanifest', mimetype='application/manifest+json')
 
     @app.route('/sw.js')
     def service_worker():
         # no-cache so browsers revalidate on every load and updates roll out promptly
-        resp = send_file(
-            os.path.join(app.static_folder, 'sw.js'),
-            mimetype='text/javascript',
-        )
+        resp = _web_file('sw.js', mimetype='text/javascript')
         resp.headers['Cache-Control'] = 'no-cache'
         return resp
 
     @app.route('/favicon.ico')
     def favicon():
-        return send_file(
-            os.path.join(app.static_folder, 'icons', 'favicon.ico'),
-            mimetype='image/vnd.microsoft.icon',
-        )
+        return _web_file('icons', 'favicon.ico', mimetype='image/vnd.microsoft.icon')
 
     # ----- Cameras -----
 
@@ -264,7 +260,6 @@ def create_app(state: CamerasState) -> Flask:
             if not enabled and not include_disabled:
                 continue
             view = state.views.get(name)
-            mgr = state.recording_mgrs.get(name)
             out.append({
                 'name': name,
                 'enabled': enabled,
@@ -290,17 +285,7 @@ def create_app(state: CamerasState) -> Flask:
             last_sent = 0
             try:
                 while True:
-                    with cond:
-                        # Wake on a new frame, or every _STREAM_KEEPALIVE_S to re-send the
-                        # last one — a write the producer's stall would otherwise withhold,
-                        # leaving a disconnect (and this worker thread) undetected.
-                        cond.wait_for(
-                            lambda: view.jpeg_version != last_sent
-                            and view.frame_jpeg is not None,
-                            _STREAM_KEEPALIVE_S,
-                        )
-                        jpeg = view.frame_jpeg
-                        last_sent = view.jpeg_version
+                    jpeg, last_sent = _next_jpeg(view, last_sent)
                     if jpeg is None:
                         continue
                     yield (
@@ -313,10 +298,7 @@ def create_app(state: CamerasState) -> Flask:
                     view.stream_clients -= 1
                     cond.notify_all()
 
-        return Response(
-            generate(),
-            mimetype='multipart/x-mixed-replace; boundary=frame',
-        )
+        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
     @app.route('/api/cameras/<name>/snapshot')
     def camera_snapshot(name):
@@ -371,45 +353,50 @@ def create_app(state: CamerasState) -> Flask:
         event = state.db.get_event(event_id)
         if not event:
             abort(404)
-        cam_out = _event_output_dir(state, event)
         for key in ('clean_clip', 'annotated_clip', 'thumbnail', 'snapshot'):
-            rel = event.get(key, '')
-            if rel:
-                p = Path(rel) if Path(rel).is_absolute() else cam_out / rel
-                if p.exists():
-                    p.unlink()
-                if key not in ('thumbnail', 'snapshot'):
-                    meta = p.with_suffix('.json')
-                    if meta.exists():
-                        meta.unlink()
+            path = _event_path(state, event, key)
+            if path is None:
+                continue
+            if path.exists():
+                path.unlink()
+            if key.endswith('_clip'):
+                meta = path.with_suffix('.json')
+                if meta.exists():
+                    meta.unlink()
         state.db.delete_event(event_id)
         return jsonify({'deleted': event_id})
 
+    def _event_image(event_id: str, key: str) -> Response:
+        event = state.db.get_event(event_id)
+        path = _event_path(state, event, key) if event else None
+        if path is None or not path.exists():
+            abort(404)
+        return send_file(str(path), mimetype='image/jpeg')
+
     @app.route('/api/events/<event_id>/thumbnail')
     def event_thumbnail(event_id):
-        event = state.db.get_event(event_id)
-        if not event or not event.get('thumbnail'):
-            abort(404)
-        thumb_path = Path(event['thumbnail'])
-        if not thumb_path.is_absolute():
-            thumb_path = _event_output_dir(state, event) / thumb_path
-        if not thumb_path.exists():
-            abort(404)
-        return send_file(str(thumb_path), mimetype='image/jpeg')
+        return _event_image(event_id, 'thumbnail')
 
     @app.route('/api/events/<event_id>/snapshot')
     def event_snapshot(event_id):
+        return _event_image(event_id, 'snapshot')
+
+    @app.route('/api/events/<event_id>/clip/<clip_type>')
+    def event_clip(event_id, clip_type):
+        if clip_type not in ('clean', 'annotated'):
+            abort(400)
         event = state.db.get_event(event_id)
-        if not event or not event.get('snapshot'):
+        clip_path = _event_path(state, event, f'{clip_type}_clip') if event else None
+        if clip_path is None:
             abort(404)
-        snap_path = Path(event['snapshot'])
-        if not snap_path.is_absolute():
-            snap_path = _event_output_dir(state, event) / snap_path
-        if not snap_path.exists():
+        h264_path = clip_path.with_name(clip_path.stem + '.h264.mp4')
+        serve_path = h264_path if h264_path.exists() else clip_path
+        if not serve_path.exists():
             abort(404)
-        return send_file(str(snap_path), mimetype='image/jpeg')
+        return _send_video(str(serve_path))
 
     # ----- Model / self-training -----
+
     @app.route('/api/model/reload', methods=['POST'])
     def model_reload():
         """Hot-swap the on-disk model into the running detector (after promotion)."""
@@ -451,33 +438,11 @@ def create_app(state: CamerasState) -> Flask:
             'latest_report': report,
         })
 
-    @app.route('/api/events/<event_id>/clip/<clip_type>')
-    def event_clip(event_id, clip_type):
-        if clip_type not in ('clean', 'annotated'):
-            abort(400)
-        event = state.db.get_event(event_id)
-        if not event:
-            abort(404)
-        rel = event.get(f'{clip_type}_clip', '')
-        if not rel:
-            abort(404)
-        clip_path = Path(rel)
-        if not clip_path.is_absolute():
-            clip_path = _event_output_dir(state, event) / clip_path
-        h264_path = clip_path.with_name(clip_path.stem + '.h264.mp4')
-        serve_path = h264_path if h264_path.exists() else clip_path
-        if not serve_path.exists():
-            abort(404)
-        return _send_video(str(serve_path))
-
     # ----- Config -----
 
     @app.route('/api/config')
     def config():
-        if not state.config:
-            return jsonify({})
-        from dataclasses import asdict
-        return jsonify(asdict(state.config))
+        return jsonify(asdict(state.config) if state.config else {})
 
     # ----- Zones (per camera) -----
 
@@ -510,9 +475,9 @@ def create_app(state: CamerasState) -> Flask:
     @app.route('/api/cameras/<name>/zones/<zname>', methods=['DELETE'])
     def delete_zone(name, zname):
         zf = _get_zone_filter(name)
-        if zf.remove_zone(zname):
-            return jsonify({'deleted': zname})
-        abort(404)
+        if not zf.remove_zone(zname):
+            abort(404)
+        return jsonify({'deleted': zname})
 
     # ----- Review (per camera, per class) -----
 
@@ -521,41 +486,17 @@ def create_app(state: CamerasState) -> Flask:
 
     @app.route('/api/cameras/<name>/review/classes')
     def review_classes(name):
-        cam_crops = _camera_crops(name)
-        if not cam_crops.is_dir():
-            return jsonify([])
-        out = []
-        for d in sorted(cam_crops.iterdir()):
-            if not d.is_dir():
-                continue
-            count = sum(
-                1 for f in d.iterdir()
-                if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
-            )
-            if count > 0:
-                out.append({'name': d.name, 'count': count})
-        return jsonify(out)
+        counts = _class_counts(_camera_crops(name))
+        return jsonify([{'name': k, 'count': n} for k, n in counts.items()])
 
     @app.route('/api/cameras/<name>/review/<class_name>')
     def review_crop(name, class_name):
-        offset = request.args.get('offset', 0, type=int)
         files = _list_images(_camera_crops(name), class_name)
-        if not files:
-            return jsonify({'total': 0, 'offset': offset, 'crop': None})
-        offset = max(0, min(offset, len(files) - 1))
-        filename = files[offset]
-        meta = _parse_crop_filename(filename) or {}
-        meta['filename'] = filename
-        meta['class'] = class_name
-        meta['camera'] = name
-        return jsonify({'total': len(files), 'offset': offset, 'crop': meta})
+        return _paged(files, 'crop', lambda fn: _crop_meta(fn, class_name, camera=name))
 
     @app.route('/api/cameras/<name>/review/<class_name>/<filename>/image')
     def review_image(name, class_name, filename):
-        path = _safe_path(_camera_crops(name), class_name, filename)
-        if not path.is_file():
-            abort(404)
-        return send_file(str(path), mimetype='image/jpeg')
+        return _send_image(_safe_path(_camera_crops(name), class_name, filename))
 
     @app.route('/api/cameras/<name>/review/<class_name>/<filename>/approve', methods=['POST'])
     def review_approve(name, class_name, filename):
@@ -564,7 +505,7 @@ def create_app(state: CamerasState) -> Flask:
             abort(404)
         dest_dir = _safe_path(state.training_dir, class_name)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / f'{name}_{filename}'  # prefix with camera to avoid name collisions
+        dest = dest_dir / f'{name}_{filename}'  # camera prefix avoids cross-camera name collisions
         shutil.move(str(src), str(dest))
         logger.info('Approved %s/%s/%s → training', name, class_name, filename)
         return jsonify({'action': 'approved', 'file': filename})
@@ -580,84 +521,39 @@ def create_app(state: CamerasState) -> Flask:
 
     # ----- Review (all cameras aggregated) -----
 
-    def _all_review_files(class_name: str) -> list[tuple[str, str]]:
-        """Ordered [(camera, filename)] for a class across every camera."""
-        out: list[tuple[str, str]] = []
-        if state.crops_dir.is_dir():
-            for cam_dir in sorted(state.crops_dir.iterdir()):
-                if cam_dir.is_dir():
-                    for fn in _list_images(cam_dir, class_name):
-                        out.append((cam_dir.name, fn))
-        return out
+    def _camera_dirs() -> list[Path]:
+        if not state.crops_dir.is_dir():
+            return []
+        return [d for d in sorted(state.crops_dir.iterdir()) if d.is_dir()]
 
     @app.route('/api/review/classes')
     def review_classes_all():
-        counts: dict[str, int] = {}
-        if state.crops_dir.is_dir():
-            for cam_dir in sorted(state.crops_dir.iterdir()):
-                if not cam_dir.is_dir():
-                    continue
-                for d in cam_dir.iterdir():
-                    if not d.is_dir():
-                        continue
-                    n = sum(1 for f in d.iterdir()
-                            if f.suffix.lower() in ('.jpg', '.jpeg', '.png'))
-                    if n:
-                        counts[d.name] = counts.get(d.name, 0) + n
+        counts: Counter[str] = Counter()
+        for cam_dir in _camera_dirs():
+            counts.update(_class_counts(cam_dir))
         return jsonify([{'name': k, 'count': counts[k]} for k in sorted(counts)])
 
     @app.route('/api/review/<class_name>')
     def review_crop_all(class_name):
-        offset = request.args.get('offset', 0, type=int)
-        files = _all_review_files(class_name)
-        if not files:
-            return jsonify({'total': 0, 'offset': offset, 'crop': None})
-        offset = max(0, min(offset, len(files) - 1))
-        camera, filename = files[offset]
-        meta = _parse_crop_filename(filename) or {}
-        meta['filename'] = filename
-        meta['class'] = class_name
-        meta['camera'] = camera  # image/approve/reject use the per-camera routes with this
-        return jsonify({'total': len(files), 'offset': offset, 'crop': meta})
+        files = [(d.name, fn) for d in _camera_dirs() for fn in _list_images(d, class_name)]
+        # image/approve/reject go through the per-camera routes with the crop's camera
+        return _paged(files, 'crop', lambda item: _crop_meta(item[1], class_name, camera=item[0]))
 
     # ----- Training (global pool) -----
 
     @app.route('/api/training/classes')
     def training_classes():
-        tdir = state.training_dir
-        if not tdir.is_dir():
-            return jsonify([])
-        out = []
-        for d in sorted(tdir.iterdir()):
-            if not d.is_dir():
-                continue
-            count = sum(
-                1 for f in d.iterdir()
-                if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
-            )
-            if count > 0:
-                out.append({'name': d.name, 'count': count})
-        return jsonify(out)
+        counts = _class_counts(state.training_dir)
+        return jsonify([{'name': k, 'count': n} for k, n in counts.items()])
 
     @app.route('/api/training/<class_name>')
     def training_image(class_name):
-        offset = request.args.get('offset', 0, type=int)
         files = _list_images(state.training_dir, class_name)
-        if not files:
-            return jsonify({'total': 0, 'offset': offset, 'image': None})
-        offset = max(0, min(offset, len(files) - 1))
-        filename = files[offset]
-        meta = _parse_crop_filename(filename) or {}
-        meta['filename'] = filename
-        meta['class'] = class_name
-        return jsonify({'total': len(files), 'offset': offset, 'image': meta})
+        return _paged(files, 'image', lambda fn: _crop_meta(fn, class_name))
 
     @app.route('/api/training/<class_name>/<filename>/image')
     def training_serve_image(class_name, filename):
-        path = _safe_path(state.training_dir, class_name, filename)
-        if not path.is_file():
-            abort(404)
-        return send_file(str(path), mimetype='image/jpeg')
+        return _send_image(_safe_path(state.training_dir, class_name, filename))
 
     @app.route('/api/training/<class_name>/<filename>', methods=['DELETE'])
     def training_delete(class_name, filename):
@@ -682,11 +578,18 @@ def create_app(state: CamerasState) -> Flask:
 # ---------- Helpers ----------
 
 def _event_output_dir(state: CamerasState, event: dict) -> Path:
-    """Return the on-disk directory that owns an event's clips."""
     camera = event.get('camera') or ''
     if camera:
         return (state.output_dir / camera).resolve()
     return state.output_dir.resolve()
+
+
+def _event_path(state: CamerasState, event: dict, key: str) -> Path | None:
+    rel = event.get(key)
+    if not rel:
+        return None
+    path = Path(rel)
+    return path if path.is_absolute() else _event_output_dir(state, event) / path
 
 
 # Storage info is cached per-process (one Flask app per process) so /api/status
@@ -767,11 +670,9 @@ def _safe_path(base: Path, *parts: str) -> Path:
     return resolved
 
 
-def _parse_crop_filename(filename):
+def _parse_crop_filename(filename: str) -> dict | None:
     """Parse track{id}_{YYYYMMDD}_{HHMMSS}[..._]{conf}.jpg with optional camera prefix."""
-    m = re.search(
-        r'track(\d+)_(\d{8})_(\d{6})_\d*_?(\d+\.\d+)\.jpg$', filename
-    )
+    m = re.search(r'track(\d+)_(\d{8})_(\d{6})_\d*_?(\d+\.\d+)\.jpg$', filename)
     if not m:
         return None
     try:
@@ -785,14 +686,50 @@ def _parse_crop_filename(filename):
     }
 
 
-def _list_images(base_dir: Path, class_name: str):
+def _crop_meta(filename: str, class_name: str, camera: str | None = None) -> dict:
+    meta = _parse_crop_filename(filename) or {}
+    meta['filename'] = filename
+    meta['class'] = class_name
+    if camera is not None:
+        meta['camera'] = camera
+    return meta
+
+
+def _is_image(path: Path) -> bool:
+    return path.suffix.lower() in _IMAGE_SUFFIXES
+
+
+def _list_images(base_dir: Path, class_name: str) -> list[str]:
     class_dir = _safe_path(base_dir, class_name)
     if not class_dir.is_dir():
         return []
-    return sorted(
-        f.name for f in class_dir.iterdir()
-        if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
-    )
+    return sorted(f.name for f in class_dir.iterdir() if _is_image(f))
+
+
+def _class_counts(base_dir: Path) -> dict[str, int]:
+    if not base_dir.is_dir():
+        return {}
+    counts = {}
+    for d in sorted(base_dir.iterdir()):
+        if d.is_dir():
+            n = sum(1 for f in d.iterdir() if _is_image(f))
+            if n:
+                counts[d.name] = n
+    return counts
+
+
+def _paged(items: list, key: str, describe) -> Response:
+    offset = request.args.get('offset', 0, type=int)
+    if not items:
+        return jsonify({'total': 0, 'offset': offset, key: None})
+    offset = max(0, min(offset, len(items) - 1))
+    return jsonify({'total': len(items), 'offset': offset, key: describe(items[offset])})
+
+
+def _send_image(path: Path) -> Response:
+    if not path.is_file():
+        abort(404)
+    return send_file(str(path), mimetype='image/jpeg')
 
 
 def _human_size(nbytes: int) -> str:
@@ -833,6 +770,15 @@ def _send_video(path: str) -> Response:
             },
         )
     return send_file(path, mimetype='video/mp4')
+
+
+def _next_jpeg(view: CameraView, last_sent: int) -> tuple[bytes | None, int]:
+    with view.frame_cond:
+        view.frame_cond.wait_for(
+            lambda: view.jpeg_version != last_sent and view.frame_jpeg is not None,
+            _STREAM_KEEPALIVE_S,
+        )
+        return view.frame_jpeg, view.jpeg_version
 
 
 def _encode_loop(view: CameraView):
@@ -882,7 +828,5 @@ def start_api_server(state: CamerasState, port: int, host: str = '0.0.0.0') -> t
     return thread
 
 
-# ---------- Backwards-compat shims (kept light to avoid stale references) ----------
-
-# Old `PipelineState` import paths may still exist in saved scripts.
+# Pre-multi-camera name, still imported by older scripts.
 PipelineState = CamerasState
