@@ -48,7 +48,11 @@ def _materialize(export_dir, run_dir=None):
     models_abs = os.path.abspath(MODELS_DIR)
     if export_dir == models_abs or export_dir.startswith(models_abs + os.sep):
         return export_dir
-    tag = os.path.basename(os.path.normpath(run_dir)) if run_dir else os.path.basename(export_dir)
+    if run_dir:
+        tag = os.path.basename(os.path.normpath(run_dir))
+    else:  # the staged candidate: name the slot after its training run, not after "best_openvino_model"
+        parent = Path(export_dir).parent
+        tag = parent.parent.name if parent.name == "weights" else parent.name
     slot = os.path.join(MODELS_DIR, f"{tag}_openvino_model")
     # Never overwrite the currently-active model dir while copying.
     if os.path.realpath(slot) == os.path.realpath(ACTIVE_LINK):
@@ -127,16 +131,15 @@ def rollback():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Promote or roll back the active VisionBox model.")
-    parser.add_argument("run_dir", nargs="?", help="Run directory containing the exported *_openvino_model")
+    parser.add_argument("run_dir", nargs="?",
+                        help="Run directory containing the exported *_openvino_model (default: the staged candidate)")
     parser.add_argument("--rollback", action="store_true", help="Restore the previously active model")
     args = parser.parse_args(argv)
 
     if args.rollback:
         rollback()
-        return 0
-    if not args.run_dir:
-        parser.error("run_dir is required unless --rollback is given")
-    promote(args.run_dir)
+    else:
+        promote(args.run_dir)
     return 0
 
 

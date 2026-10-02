@@ -217,6 +217,16 @@ class PromoteModel(unittest.TestCase):
         self.assertEqual(promote.promote(durable), durable)
         self.assertEqual(self.reloads, ['sighup'])
 
+    def test_promote_without_run_dir_uses_the_staged_candidate(self):
+        self._activate_base()
+        export = self._export('overnight_4')
+        os.symlink(export, promote.CANDIDATE_LINK)
+        self.assertEqual(promote.main([]), 0)
+        durable = str(self.models / 'overnight_4_openvino_model')
+        self.assertTrue((Path(durable) / 'metadata.yaml').is_file())
+        self.assertEqual(os.path.realpath(promote.ACTIVE_LINK), durable)
+        self.assertEqual(self.reloads, ['sighup'])
+
     def test_rollback_restores_previous_target(self):
         base = self._activate_base()
         promote.promote(str(self._export('overnight_3').parents[1]))
