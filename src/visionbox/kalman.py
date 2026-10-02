@@ -12,8 +12,7 @@ class KalmanBoxTracker:
     count = 0
 
     def __init__(self, bbox: np.ndarray):
-        self.state = self._bbox_to_state(bbox)
-        self.state = np.concatenate([self.state, np.zeros(4)])
+        self.state = np.concatenate([self._bbox_to_state(bbox), np.zeros(4)])
 
         self.P = np.diag([
             10, 10, 10, 10,        # position uncertainty

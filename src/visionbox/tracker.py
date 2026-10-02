@@ -6,18 +6,19 @@ from scipy.optimize import linear_sum_assignment
 from .kalman import KalmanBoxTracker
 
 
-def iou_numpy(box1: np.ndarray, box2: np.ndarray) -> float:
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
+def iou_matrix(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
+    """Pairwise IoU of (N, 4) and (M, 4) arrays of [x1, y1, x2, y2] boxes as an (N, M) array."""
+    a = np.asarray(boxes_a, dtype=float)[:, None, :]
+    b = np.asarray(boxes_b, dtype=float)[None, :, :]
 
-    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union_area = box1_area + box2_area - inter_area
+    inter_w = np.maximum(0, np.minimum(a[..., 2], b[..., 2]) - np.maximum(a[..., 0], b[..., 0]))
+    inter_h = np.maximum(0, np.minimum(a[..., 3], b[..., 3]) - np.maximum(a[..., 1], b[..., 1]))
+    inter = inter_w * inter_h
+    area_a = (a[..., 2] - a[..., 0]) * (a[..., 3] - a[..., 1])
+    area_b = (b[..., 2] - b[..., 0]) * (b[..., 3] - b[..., 1])
+    union = area_a + area_b - inter
 
-    return inter_area / union_area if union_area > 0 else 0
+    return np.divide(inter, union, out=np.zeros_like(inter), where=union > 0)
 
 
 def iou_cost_matrix(tracks: list[KalmanBoxTracker], detections: np.ndarray) -> np.ndarray:
@@ -25,13 +26,7 @@ def iou_cost_matrix(tracks: list[KalmanBoxTracker], detections: np.ndarray) -> n
         return np.empty((len(tracks), len(detections)))
 
     track_boxes = np.array([t.get_state() for t in tracks])
-    cost_matrix = np.zeros((len(tracks), len(detections)))
-
-    for t_idx, track_box in enumerate(track_boxes):
-        for d_idx, det_box in enumerate(detections):
-            cost_matrix[t_idx, d_idx] = 1 - iou_numpy(track_box, det_box)
-
-    return cost_matrix
+    return 1 - iou_matrix(track_boxes, detections)
 
 
 def associate_detections_to_tracks(
@@ -48,14 +43,14 @@ def associate_detections_to_tracks(
     cost_matrix = iou_cost_matrix(tracks, detections[:, :4])
     track_indices, det_indices = linear_sum_assignment(cost_matrix)
 
-    matches = []
-    for t_idx, d_idx in zip(track_indices, det_indices):
-        if cost_matrix[t_idx, d_idx] > (1 - iou_threshold):
-            continue
-        matches.append((t_idx, d_idx))
+    matches = [
+        (t_idx, d_idx)
+        for t_idx, d_idx in zip(track_indices, det_indices, strict=True)
+        if cost_matrix[t_idx, d_idx] <= (1 - iou_threshold)
+    ]
 
-    matched_tracks = {m[0] for m in matches}
-    matched_dets = {m[1] for m in matches}
+    matched_tracks = {t for t, _ in matches}
+    matched_dets = {d for _, d in matches}
     unmatched_tracks = [i for i in range(len(tracks)) if i not in matched_tracks]
     unmatched_dets = [i for i in range(len(detections)) if i not in matched_dets]
 
@@ -95,11 +90,11 @@ class Tracker:
 
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
 
-        results = []
-        for track in self.tracks:
-            if track.hits >= self.min_hits and track.time_since_update <= self.max_coast:
-                bbox = track.get_state()
-                results.append([*bbox, track.id])
+        results = [
+            [*track.get_state(), track.id]
+            for track in self.tracks
+            if track.hits >= self.min_hits and track.time_since_update <= self.max_coast
+        ]
 
         return np.array(results) if results else np.empty((0, 5))
 
