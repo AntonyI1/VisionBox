@@ -28,7 +28,7 @@ def _upgrade_snapshot(clip_path: str, offset: float, dest: Path):
            '-frames:v', '1', '-q:v', '2', '-y', str(tmp)]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=60)
+                              stderr=subprocess.DEVNULL, timeout=60, check=False)
         if proc.returncode == 0 and tmp.stat().st_size > 0:
             tmp.replace(dest)
             return
@@ -114,8 +114,7 @@ class RecordingManager:
             area_ratio = min(1.0, (bw * bh) / area) if area else 0.0
             touches = (x1 <= mx) + (y1 <= my) + (x2 >= w - mx) + (y2 >= h - my)
             score = float(d.get('confidence', 0.0)) * (area_ratio ** AREA_WEIGHT) * (EDGE_PENALTY ** touches)
-            if score > best:
-                best = score
+            best = max(best, score)
         return best
 
     def update(
@@ -135,13 +134,13 @@ class RecordingManager:
                 triggered, detections,
             )
 
-        if not was_recording and self.annotated and self.annotated.is_recording:
-            self._start_event()
-        elif not was_recording and self.annotated is None and triggered:
-            self._start_event()
+        if not was_recording:
+            started = self.annotated.is_recording if self.annotated else triggered
+            if started:
+                self._start_event()
 
-        # Score the snapshot and tally labels from the trigger subset (confirmed+moving objects)
-        # when provided, so parked cars no longer dominate top_label / detection_count / snapshot.
+        # Score the snapshot and tally labels from the trigger subset (confirmed, moving objects)
+        # when given, so parked cars do not dominate top_label / detection_count / snapshot.
         score_dets = trigger_detections if trigger_detections is not None else detections
         if self._current_event_id and score_dets:
             score = self._frame_score(score_dets, frame.shape[1], frame.shape[0])
@@ -155,10 +154,8 @@ class RecordingManager:
                 for d in score_dets:
                     self._detection_counts[d.get('class_name', 'unknown')] += 1
 
-        if was_recording:
-            annotated_idle = self.annotated is None or self.annotated.state == RecorderState.IDLE
-            if annotated_idle:
-                self._end_event()
+        if was_recording and (self.annotated is None or self.annotated.state == RecorderState.IDLE):
+            self._end_event()
 
     @property
     def is_recording(self) -> bool:
@@ -178,16 +175,21 @@ class RecordingManager:
         suffix = f'_{self.camera}' if self.camera else ''
         return ts.strftime('%Y%m%d_%H%M%S') + suffix
 
-    def _start_event(self):
-        now = datetime.now()
-        event_id = self._event_key(now)
-        self._current_event_id = event_id
-        self._event_start = now
+    def _reset_event_state(self):
+        self._current_event_id = None
+        self._event_start = None
         self._detection_counts.clear()
         self._best_thumb = None
         self._best_snapshot = None
         self._best_score = 0.0
         self._best_ts = 0.0
+
+    def _start_event(self):
+        self._reset_event_state()
+        now = datetime.now()
+        event_id = self._event_key(now)
+        self._current_event_id = event_id
+        self._event_start = now
 
         clean_clip = ''
         if self.clean:
@@ -258,13 +260,7 @@ class RecordingManager:
                     daemon=True, name=f'snapshot-{self.camera or "default"}',
                 ).start()
 
-        self._current_event_id = None
-        self._event_start = None
-        self._detection_counts.clear()
-        self._best_thumb = None
-        self._best_snapshot = None
-        self._best_score = 0.0
-        self._best_ts = 0.0
+        self._reset_event_state()
         self._enforce_limits()
 
     def _enforce_limits(self):
@@ -275,8 +271,8 @@ class RecordingManager:
         priority = set(self.config.retention.priority_labels)
         counts = self.db.get_label_counts(camera=self.camera or None)
 
-        non_priority = [l for l in counts if l not in priority and counts[l] > max_keep]
-        priority_over = [l for l in counts if l in priority and counts[l] > max_keep]
+        non_priority = [label for label, n in counts.items() if label not in priority and n > max_keep]
+        priority_over = [label for label, n in counts.items() if label in priority and n > max_keep]
 
         for label in non_priority + priority_over:
             overflow = self.db.get_overflow_events(label, max_keep, camera=self.camera or None)
@@ -284,24 +280,24 @@ class RecordingManager:
                 self._delete_event_files(ev)
                 self.db.delete_event(ev['event_id'])
 
-    def _delete_event_files(self, event: dict):
-        out = self.output_dir
+    def _delete_event_files(self, event: dict) -> int:
+        """Remove an event's clips, sidecar metadata, thumbnail and snapshot; returns bytes freed."""
+        freed = 0
         for key in ('clean_clip', 'annotated_clip', 'thumbnail', 'snapshot'):
             rel = event.get(key, '')
             if not rel:
                 continue
-            p = Path(rel) if Path(rel).is_absolute() else out / rel
-            if p.exists():
-                p.unlink()
-            if key not in ('thumbnail', 'snapshot'):
-                meta = p.with_suffix('.json')
-                if meta.exists():
-                    meta.unlink()
+            path = Path(rel) if Path(rel).is_absolute() else self.output_dir / rel
+            targets = [path] if key in ('thumbnail', 'snapshot') else [path, path.with_suffix('.json')]
+            for p in targets:
+                if p.exists():
+                    freed += p.stat().st_size
+                    p.unlink()
+        return freed
 
     def _retention_loop(self):
         while not self._retention_stop.wait(self.config.retention.check_interval):
             cutoff = datetime.now() - timedelta(days=self.config.retention.days)
-            # Filter to this camera's events only
             events = [
                 e for e in self.db.get_events_before(cutoff)
                 if (e.get('camera') or '') == self.camera
@@ -332,27 +328,8 @@ class RecordingManager:
         for event in events:
             if current <= max_bytes:
                 break
-            freed = self._delete_event_files_sized(event)
+            current -= self._delete_event_files(event)
             self.db.delete_event(event['event_id'])
-            current -= freed
-
-    def _delete_event_files_sized(self, event: dict) -> int:
-        freed = 0
-        out = self.output_dir
-        for key in ('clean_clip', 'annotated_clip', 'thumbnail', 'snapshot'):
-            rel = event.get(key, '')
-            if not rel:
-                continue
-            p = Path(rel) if Path(rel).is_absolute() else out / rel
-            if p.exists():
-                freed += p.stat().st_size
-                p.unlink()
-            if key not in ('thumbnail', 'snapshot'):
-                meta = p.with_suffix('.json')
-                if meta.exists():
-                    freed += meta.stat().st_size
-                    meta.unlink()
-        return freed
 
     def stop(self):
         if self._current_event_id:
