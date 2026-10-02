@@ -34,8 +34,6 @@ wheels/
 *.pth
 *.onnx
 *.weights
-models/*.pt
-models/*.onnx
 models/.cache/
 
 # IDE
@@ -45,12 +43,18 @@ models/.cache/
 *.swo
 *~
 
+# Editor / patch leftovers
+*.bak*
+*.orig
+*.rej
+
 # OS
 .DS_Store
 Thumbs.db
 
-# Testing
+# Testing / linting
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
@@ -67,9 +71,10 @@ output/
 # TensorRT engines (GPU-specific, not portable)
 *.engine
 
-# OpenVINO IR models (exported per-machine)
+# OpenVINO IR models (exported per-machine) and the self-training model slots
 *_openvino_model/
 models/yolov8n_openvino_model
+models/candidate
 models/.prev_active
 
 # OpenVINO GPU kernel diagnostic dump (regenerated on GPU kernel warnings)
