@@ -4,14 +4,15 @@ State: IDLE → RECORDING → COOLDOWN → IDLE
 """
 
 import json
-import shutil
 import subprocess
 import time
-import numpy as np
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from datetime import datetime
-from dataclasses import dataclass, field
+
+import numpy as np
 
 
 class RecorderState(Enum):
@@ -25,21 +26,12 @@ class EventMetadata:
     start_time: str = ""
     end_time: str = ""
     duration_seconds: float = 0.0
-    detections: list = field(default_factory=list)
     detection_count: int = 0
     max_objects_in_frame: int = 0
 
     def add_detections(self, dets: list[dict]):
-        if not dets:
-            return
         self.detection_count += len(dets)
         self.max_objects_in_frame = max(self.max_objects_in_frame, len(dets))
-        for d in dets:
-            cls = d.get('class_name', d.get('class', 'unknown'))
-            conf = d.get('confidence', 0)
-            entry = {'class': cls, 'confidence': round(conf, 3)}
-            if entry not in self.detections[-10:]:
-                self.detections.append(entry)
 
 
 class EventRecorder:
@@ -55,15 +47,14 @@ class EventRecorder:
         self.cooldown = cooldown
         self.fps = fps
         self.max_duration = max_duration
-        self._use_ffmpeg = bool(shutil.which('ffmpeg'))
 
         self.state = RecorderState.IDLE
         self._process: subprocess.Popen | None = None
         self._current_path: Path | None = None
+        self._meta_path: Path | None = None
         self._meta: EventMetadata | None = None
         self._last_trigger: float = 0
         self._start_time: float = 0
-        self._frame_size: tuple[int, int] | None = None
 
     @property
     def is_recording(self) -> bool:
@@ -72,7 +63,7 @@ class EventRecorder:
     @property
     def event_id(self) -> str | None:
         if self._current_path is not None:
-            return self._current_path.stem.replace('event_', '')
+            return self._current_path.stem.removeprefix('event_')
         return None
 
     def update(self, frame: np.ndarray, triggered: bool, detections: list[dict] | None = None):
@@ -105,22 +96,19 @@ class EventRecorder:
                 return
 
         if self.is_recording and self._process is not None:
-            try:
+            with suppress(OSError):
                 self._process.stdin.write(frame.tobytes())
-            except (BrokenPipeError, OSError):
-                pass
             if detections and self._meta:
                 self._meta.add_detections(detections)
 
     def _start_recording(self, frame: np.ndarray, now: float):
         h, w = frame.shape[:2]
-        self._frame_size = (w, h)
         self._start_time = now
         self._last_trigger = now
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._current_path = self.output_dir / f"event_{timestamp}.mp4"
-        meta_path = self.output_dir / f"event_{timestamp}.json"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._current_path = self.output_dir / f'event_{timestamp}.mp4'
+        self._meta_path = self._current_path.with_suffix('.json')
 
         cmd = [
             'ffmpeg', '-y',
@@ -142,15 +130,16 @@ class EventRecorder:
             self._process = None
 
         self._meta = EventMetadata(start_time=datetime.now().isoformat())
-        self._meta_path = meta_path
 
     def _stop_recording(self, now: float):
         if self._process is not None:
-            try:
+            with suppress(OSError):
                 self._process.stdin.close()
-            except OSError:
-                pass
-            self._process.wait(timeout=10)
+            try:
+                self._process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait()
             self._process = None
 
         if self._meta is not None:

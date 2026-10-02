@@ -1,11 +1,12 @@
 """FFmpeg clean recorder — copies H.264 from RTSP with zero CPU."""
 
 import json
-import signal
 import shutil
+import signal
 import subprocess
+from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
 
 
 class CleanRecorder:
@@ -41,7 +42,7 @@ class CleanRecorder:
             return None
 
         self._event_id = event_id
-        self._start_time = datetime.now(timezone.utc)
+        self._start_time = datetime.now(UTC)
         self._current_path = self.output_dir / f"event_{event_id}.mp4"
 
         cmd = [
@@ -79,14 +80,11 @@ class CleanRecorder:
         self._process = None
         path = self._current_path
 
-        # Drop broken/empty clips. With fragmented MP4 even a killed ffmpeg leaves a playable
-        # file, so anything under the floor is genuinely unusable; null it so callers can clear
-        # the DB column while keeping the annotated clip + event row.
+        # Fragmented MP4 means even a killed ffmpeg leaves a playable file, so anything under
+        # the size floor is genuinely broken; return None so the caller clears the DB column.
         if path and path.exists() and path.stat().st_size < self.min_valid_bytes:
-            try:
+            with suppress(OSError):
                 path.unlink()
-            except OSError:
-                pass
             path = None
 
         if path and path.exists() and self._start_time:
