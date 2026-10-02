@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Reversible de-duplication of Review crops.
+"""Reversible de-duplication of review crops.
 
-Within each camera/class folder, near-identical crops (same object / same scene,
-snapped repeatedly) are clustered by perceptual hash (dHash); the best one per
-cluster is kept (highest detection confidence, then largest file) and the rest are
-MOVED (never deleted) to captures/crops/_trash/ with a manifest for restore.
+Within each camera/class folder, near-identical crops (same object, snapped repeatedly)
+are clustered by perceptual hash (dHash); the best one per cluster is kept (highest
+detection confidence, then largest file) and the rest are MOVED, never deleted, to
+<crops>/_trash/ with a manifest for restore.
 
 Usage:
   dedupe_crops.py                 # dry-run (counts only)
@@ -14,15 +14,20 @@ Usage:
 """
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import cv2
+from dotenv import load_dotenv
 
-CROPS_DEFAULT = '/mnt/storage/visionbox/captures/crops'
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / '.env')
+
+STORAGE_DIR = os.environ.get('STORAGE_DIR')
+CROPS_DEFAULT = f'{STORAGE_DIR}/captures/crops' if STORAGE_DIR else None
 IMG_EXT = ('.jpg', '.jpeg', '.png')
 CONF_RE = re.compile(r'_(\d+\.\d+)\.(?:jpg|jpeg|png)$', re.I)
 
@@ -115,7 +120,7 @@ def restore(root: Path):
     if not mp.exists():
         print("No manifest; nothing to restore.")
         return
-    entries = [json.loads(l) for l in mp.read_text().splitlines() if l.strip()]
+    entries = [json.loads(line) for line in mp.read_text().splitlines() if line.strip()]
     n = 0
     for e in entries:
         dst, src = Path(e['dst']), Path(e['src'])
@@ -129,11 +134,13 @@ def restore(root: Path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--crops', default=CROPS_DEFAULT)
+    ap.add_argument('--crops', default=CROPS_DEFAULT, help='crops root (default: $STORAGE_DIR/captures/crops)')
     ap.add_argument('--threshold', type=int, default=6, help='max hamming distance for near-identical')
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--restore', action='store_true')
     args = ap.parse_args()
+    if not args.crops:
+        sys.exit("STORAGE_DIR is not set (see .env.sample); pass --crops explicitly")
     root = Path(args.crops)
     if not root.is_dir():
         sys.exit(f"crops dir not found: {root}")
