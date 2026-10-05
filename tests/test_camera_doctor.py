@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 _TMP = tempfile.mkdtemp(prefix='camera_doctor_test_')
@@ -333,6 +334,44 @@ class StateCompat(unittest.TestCase):
         st = cd.normalise_state({})
         st['front_door']['link']['last']['x'] = 1
         self.assertNotIn('x', st['backyard']['link']['last'])
+
+
+class AtomicState(unittest.TestCase):
+    """save_state() leaves either the previous or the complete new state behind, never a partial file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.target = Path(self.tmp.name) / 'state.json'
+        self.old = {'frigate': {'restarts': [NOW - 300], 'alerts': {'needs_human': NOW}}}
+        self.target.write_text(json.dumps(self.old))
+        self.state_file = patch.object(cd, 'STATE_FILE', self.target)
+        self.state_file.start()
+
+    def tearDown(self):
+        self.state_file.stop()
+        self.tmp.cleanup()
+
+    def files(self):
+        return list(Path(self.tmp.name).iterdir())
+
+    def test_replaces_the_file_with_the_complete_new_state(self):
+        new = cd.normalise_state(copy.deepcopy(self.old))
+        new['frigate']['restarts'].append(NOW)
+        cd.save_state(new)
+        self.assertEqual(json.loads(self.target.read_text()), new)
+        self.assertEqual(self.files(), [self.target])
+
+    def test_failed_replace_keeps_the_previous_state_and_no_pending_file(self):
+        with patch.object(cd.os, 'replace', side_effect=OSError('interrupted')), self.assertRaises(OSError):
+            cd.save_state({'frigate': {'restarts': []}})
+        self.assertEqual(json.loads(self.target.read_text()), self.old)
+        self.assertEqual(self.files(), [self.target])
+
+    def test_failed_flush_keeps_the_previous_state(self):
+        with patch.object(cd.os, 'fsync', side_effect=OSError('disk full')), self.assertRaises(OSError):
+            cd.save_state({'frigate': {'restarts': []}})
+        self.assertEqual(json.loads(self.target.read_text()), self.old)
+        self.assertEqual(self.files(), [self.target])
 
 
 class EnvFile(unittest.TestCase):

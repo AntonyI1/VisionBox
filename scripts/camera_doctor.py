@@ -55,6 +55,7 @@ import re
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -666,6 +667,21 @@ def normalise_state(state: dict) -> dict:
     return state
 
 
+def save_state(state: dict):
+    """Replace the state file atomically: an interrupted run must not erase cooldowns or the restart budget."""
+    fd, name = tempfile.mkstemp(prefix=f'.{STATE_FILE.name}.', suffix='.tmp', dir=STATE_FILE.parent)
+    pending = Path(name)
+    try:
+        with os.fdopen(fd, 'w') as out:
+            out.write(json.dumps(state))
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(pending, STATE_FILE)
+    finally:
+        with suppress(OSError):
+            pending.unlink()
+
+
 # ---------------------------------------------------------------------------
 # Link attribution
 # ---------------------------------------------------------------------------
@@ -955,7 +971,7 @@ def auto_restart(state: dict, why: str, now: float):
     # Persist the restart before issuing it so a killed run cannot cause a loop.
     fs['restarts'].append(now)
     fs.update(strikes=0, frame_hash={}, log_cursor=now, verify_after_restart=True)
-    STATE_FILE.write_text(json.dumps(state))
+    save_state(state)
     try:
         subprocess.run([DOCKER, 'restart', FRIGATE_CONTAINER], capture_output=True, text=True, timeout=180, check=True)
         result = 'done'
@@ -1123,7 +1139,7 @@ def run(verbose: bool):
     except Exception as exc:  # the camera checks above must never be lost to a watchdog bug
         log(f'[frigate] watchdog error: {type(exc).__name__}: {exc}')
 
-    STATE_FILE.write_text(json.dumps(state))
+    save_state(state)
     trim_log()
 
 
