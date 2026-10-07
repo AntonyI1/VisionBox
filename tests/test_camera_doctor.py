@@ -7,12 +7,15 @@ Run from the repo root with `venv/bin/python3 -m unittest tests.test_camera_doct
 """
 import copy
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -78,6 +81,11 @@ PID_STATS = {'front_garage': {'capture_pid': 1187, 'pid': 1084}, 'backyard': {'c
 
 def real_state():
     return cd.normalise_state(copy.deepcopy(REAL_STATE))
+
+
+def pushes_into(pushes: list):
+    """A notify() stand-in that records (title, message) and reports the push as delivered."""
+    return lambda title, message: pushes.append((title, message)) or True
 
 
 class ParsePing(unittest.TestCase):
@@ -272,6 +280,16 @@ class LinkHysteresis(unittest.TestCase):
         ls, ev = self.run_seq(ls, [False] * 6, NOW)
         self.assertEqual(set(ev), {''})
 
+    def test_degraded_since_marks_the_episode_start(self):
+        ls = dict(cd.LINK_STATE_DEFAULTS)
+        ls, ev = self.run_seq(ls, [True, True, True, True], NOW)
+        self.assertEqual((ev[-1], ls['degraded_since']), ('degraded', NOW))
+        # clean runs inside the hysteresis window reset bad_since but not the episode
+        ls, ev = self.run_seq(ls, [False, True, False], NOW + 1200)
+        self.assertEqual((set(ev), ls['status'], ls['bad_since'], ls['degraded_since']), ({''}, 'degraded', None, NOW))
+        ls, ev = self.run_seq(ls, [False, False, False], NOW + 2100)
+        self.assertEqual((ev[-1], ls['degraded_since']), ('recovered', None))
+
 
 class AlertDedupe(unittest.TestCase):
     def test_windows(self):
@@ -287,15 +305,25 @@ class AlertDedupe(unittest.TestCase):
 
     def test_alert_helper_records_and_dedupes(self):
         sent = []
-        cd.notify = lambda t, m: sent.append(t)
+        cd.notify = pushes_into(sent)
         try:
             state = {'frigate': {'alerts': {}}}
             self.assertTrue(cd.alert(state, 'k', 'T', 'm', NOW))
             self.assertFalse(cd.alert(state, 'k', 'T', 'm', NOW + 100))
             self.assertTrue(cd.alert(state, 'k', 'T', 'm', NOW + 3600))
-            self.assertEqual(sent, ['T', 'T'])
+            self.assertEqual([t for t, _ in sent], ['T', 'T'])
         finally:
             cd.notify = ORIG_NOTIFY
+
+    def test_failed_delivery_does_not_start_the_repeat_window(self):
+        state = cd.normalise_state({})
+        with patch.object(cd, 'notify', side_effect=[False, True]) as delivery:
+            self.assertFalse(cd.alert(state, 'k', 'T', 'm', NOW))
+            self.assertNotIn('k', state['frigate']['alerts'])
+            self.assertTrue(cd.alert(state, 'k', 'T', 'm', NOW + 300))
+            self.assertFalse(cd.alert(state, 'k', 'T', 'm', NOW + 600))
+        self.assertEqual(delivery.call_count, 2)
+        self.assertEqual(state['frigate']['alerts']['k'], NOW + 300)
 
     def test_human_alert_seeded_from_old_budget_key(self):
         st = real_state()
@@ -334,6 +362,11 @@ class StateCompat(unittest.TestCase):
         st = cd.normalise_state({})
         st['front_door']['link']['last']['x'] = 1
         self.assertNotIn('x', st['backyard']['link']['last'])
+
+    def test_degraded_link_from_an_older_file_gets_its_episode_start(self):
+        st = cd.normalise_state({'backyard': {'link': {'status': 'degraded', 'bad_since': NOW - 3600}}})
+        self.assertEqual(st['backyard']['link']['degraded_since'], NOW - 3600)
+        self.assertIsNone(st['front_door']['link']['degraded_since'])
 
 
 class AtomicState(unittest.TestCase):
@@ -507,7 +540,7 @@ class Fake:
         cd.http_get = self.http_get
         cd.container_state = lambda: ('running', NOW - 3 * 3600)
         cd.nfs_write_probe = lambda d, timeout=20: 'ok'
-        cd.notify = lambda t, m: self.pushes.append((t, m))
+        cd.notify = pushes_into(self.pushes)
         cd.frame_hash = self.fake_frame_hash
         cd.probe_pids = lambda pids: {int(p): self.pid_alive.get(int(p), True) for p in pids}
         cd.probe_rss = lambda pids: dict(self.rss)
@@ -756,7 +789,7 @@ class CameraLayer(unittest.TestCase):
                                                   'measure_links')}
         cd.rtsp_alive = lambda url, timeout=4.0: self.alive[URL_TO_CAM[url]]
         cd.rtsp_status = lambda url, timeout=4.0: self.restream_status[RESTREAM_TO_CAM[url.rsplit('/', 1)[1]]]
-        cd.notify = lambda t, m: self.pushes.append((t, m))
+        cd.notify = pushes_into(self.pushes)
         cd.onvif_reboot = lambda host, *a: self.reboots.append(host) or 'accepted'
 
     def tearDown(self):
@@ -848,6 +881,38 @@ class CameraLayer(unittest.TestCase):
         self.assertEqual([t for t, _ in self.pushes][-1], 'VisionBox: backyard link recovered')
         self.assertEqual((state['backyard']['link']['status'], state['backyard']['link']['alerted']), ('ok', False))
 
+    def test_degraded_episode_retries_a_failed_delivery_on_the_next_run(self):
+        state = cd.normalise_state({})
+        state['backyard']['link']['bad_since'] = NOW - cd.LINK_HOLD_S
+        with patch.object(cd, 'notify', side_effect=[False, True]) as delivery:
+            cd.update_link_state(state, 'backyard', LINK_TODAY['backyard'], NOW)
+            self.assertEqual((state['backyard']['link']['status'], state['backyard']['link']['alerted']),
+                             ('degraded', False))
+            cd.update_link_state(state, 'backyard', LINK_TODAY['backyard'], NOW + 300)
+            self.assertTrue(state['backyard']['link']['alerted'])
+            cd.update_link_state(state, 'backyard', LINK_TODAY['backyard'], NOW + 600)
+        self.assertEqual(delivery.call_count, 2)
+
+    def test_pending_link_push_reports_the_episode_start_not_the_latest_bad_run(self):
+        state = cd.normalise_state({})
+        state['backyard']['link']['bad_since'] = NOW - cd.LINK_HOLD_S
+        with patch.object(cd, 'notify', side_effect=[False, True]) as delivery:
+            cd.update_link_state(state, 'backyard', LINK_TODAY['backyard'], NOW)  # degraded, push not delivered
+            cd.update_link_state(state, 'backyard', OK_LINK, NOW + 300)  # a clean run inside the hysteresis window
+            cd.update_link_state(state, 'backyard', LINK_TODAY['backyard'], NOW + 600)
+        self.assertEqual(state['backyard']['link']['degraded_since'], NOW - cd.LINK_HOLD_S)
+        self.assertIn(f'link degraded for {(cd.LINK_HOLD_S + 600) // 60} min', delivery.call_args.args[1])
+
+    def test_link_push_inside_the_repeat_window_waits_for_it_to_pass(self):
+        state = cd.normalise_state({})
+        state['frigate']['alerts']['link_backyard'] = NOW - 3600  # the previous episode was pushed an hour ago
+        state['backyard']['link']['bad_since'] = NOW - cd.LINK_HOLD_S
+        cd.update_link_state(state, 'backyard', LINK_TODAY['backyard'], NOW)
+        self.assertEqual((self.pushes, state['backyard']['link']['status']), ([], 'degraded'))
+        cd.update_link_state(state, 'backyard', LINK_TODAY['backyard'], NOW - 3600 + cd.LINK_ALERT_REPEAT_S)
+        self.assertEqual([t for t, _ in self.pushes], ['VisionBox: backyard link degraded'])
+        self.assertTrue(state['backyard']['link']['alerted'])
+
     def test_dead_restream_blames_frigate_only_on_a_clean_link(self):
         state = cd.normalise_state({})
         state['backyard']['restream_fails'] = cd.FAILS_BEFORE_DOWN
@@ -915,6 +980,85 @@ class DeadProcesses(ReplayCase):
         self.run_wd(fake, state, LINK_CLEAN, runs=3)
         self.assertEqual([t for t, _ in fake.pushes], ['VisionBox: backyard capture process ballooning'])
         self.assertEqual(fake.restarts, [])
+
+
+class NotifyFallback(unittest.TestCase):
+    """notify() retries a failed push on the fallback topic and reports whether anything was delivered."""
+    KEYS = ('NTFY_TOPIC', 'NTFY_URL', 'NTFY_FALLBACK_URL', 'NTFY_FALLBACK_TOPIC')
+
+    def setUp(self):
+        self.saved = {k: os.environ.get(k) for k in self.KEYS}
+        os.environ.update(NTFY_TOPIC='cameras', NTFY_URL='https://ntfy.example', NTFY_FALLBACK_URL='https://ntfy.sh',
+                          NTFY_FALLBACK_TOPIC='fb-topic')
+        self.calls, self.failing = [], {}
+        self.orig_push = cd._push
+
+        def fake_push(base, topic, title, message, timeout=10):
+            self.calls.append((base, topic, title, message))
+            if base in self.failing:
+                raise self.failing[base]
+        cd._push = fake_push
+
+    def tearDown(self):
+        cd._push = self.orig_push
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def notify(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            delivered = cd.notify('T', 'm')
+        return delivered, out.getvalue()
+
+    def test_primary_alone_when_it_works(self):
+        self.assertEqual(self.notify(), (True, ''))
+        self.assertEqual(self.calls, [('https://ntfy.example', 'cameras', 'T', 'm')])
+
+    def test_fallback_carries_the_same_push_and_the_primary_failure_is_diagnosed(self):
+        self.failing['https://ntfy.example'] = urllib.error.HTTPError(
+            'https://ntfy.example/cameras', 403, 'Forbidden', None, io.BytesIO(b'{"code":40301,"http":403}'))
+        delivered, out = self.notify()
+        self.assertTrue(delivered)
+        self.assertEqual(self.calls, [('https://ntfy.example', 'cameras', 'T', 'm'),
+                                      ('https://ntfy.sh', 'fb-topic', 'T', 'm')])
+        self.assertIn('notify failed on ntfy.example: HTTP 403 Forbidden {"code":40301,"http":403}', out)
+        self.assertIn('notify: delivered via fallback ntfy.sh', out)
+
+    def test_without_a_fallback_topic_only_the_primary_is_tried(self):
+        os.environ.pop('NTFY_FALLBACK_TOPIC')
+        self.failing['https://ntfy.example'] = OSError('timed out')
+        self.assertFalse(self.notify()[0])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_both_failing_is_not_delivered_and_never_raises(self):
+        self.failing = dict.fromkeys(('https://ntfy.example', 'https://ntfy.sh'), OSError('timed out'))
+        delivered, out = self.notify()
+        self.assertFalse(delivered)
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn('notify failed on fallback ntfy.sh: OSError: timed out', out)
+
+    def test_pushes_switched_off_count_as_handled(self):
+        os.environ.pop('NTFY_TOPIC')
+        self.assertEqual(self.notify(), (True, ''))
+        self.assertEqual(self.calls, [])
+
+
+class DescribeError(unittest.TestCase):
+    def test_http_error_carries_status_reason_and_a_json_body(self):
+        exc = urllib.error.HTTPError('https://x', 429, 'Too Many Requests', None, io.BytesIO(b'{"code":42901}'))
+        self.assertEqual(cd.describe_error(exc), 'HTTP 429 Too Many Requests {"code":42901}')
+        exc = urllib.error.HTTPError('https://x', 502, 'Bad Gateway', None, io.BytesIO(b'<html>nginx</html>'))
+        self.assertEqual(cd.describe_error(exc), 'HTTP 502 Bad Gateway')
+        exc = urllib.error.HTTPError('https://x', 404, 'Not Found', None, None)
+        self.assertEqual(cd.describe_error(exc), 'HTTP 404 Not Found')
+
+    def test_url_and_socket_errors_name_the_cause(self):
+        self.assertEqual(cd.describe_error(urllib.error.URLError(OSError(111, 'Connection refused'))),
+                         'URLError: [Errno 111] Connection refused')
+        self.assertEqual(cd.describe_error(TimeoutError('timed out')), 'TimeoutError: timed out')
 
 
 if __name__ == '__main__':

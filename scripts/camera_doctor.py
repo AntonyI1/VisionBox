@@ -33,6 +33,12 @@ per camera once the condition has held LINK_HOLD_S and one "link recovered"
 push after as long clean. Only a symptom on a demonstrably healthy link is a
 pipeline strike.
 
+Pushes. The self-hosted ntfy server lives on the tailnet, so it is unreachable
+exactly when this box falls off it: a push that fails on NTFY_URL is retried
+on NTFY_FALLBACK_URL/NTFY_FALLBACK_TOPIC, a public ntfy.sh topic by default,
+which is why pushes never carry secrets. An alert that could not be delivered
+at all is retried on the next run instead of starting its repeat window.
+
 Policy helpers are pure functions and are unit-tested directly. --dry-run
 prints every decision without restarting, rebooting or notifying. Tunables
 can be overridden from .env: FRIGATE_API, FRIGATE_CONTAINER,
@@ -40,9 +46,9 @@ FRIGATE_NFS_MOUNT, DOCTOR_WARMUP_S, DOCTOR_RESTART_COOLDOWN_S,
 DOCTOR_WIRED_CAMERAS, DOCTOR_LINK_LOSS_PCT, DOCTOR_LINK_RTT_MS,
 DOCTOR_LINK_HOLD_S, DOCTOR_LINK_ALERT_REPEAT_S, DOCTOR_PRODUCER_SAMPLE_S,
 DOCTOR_PRODUCER_MIN_BPS, DOCTOR_PING_COUNT, DOCTOR_HUMAN_REPEAT_S,
-DOCTOR_CAPTURE_RSS_ALERT_MB, NTFY_TOPIC, NTFY_URL; DOCTOR_STATE_FILE and
-DOCTOR_ENV_FILE relocate the state file and .env so a copy can be exercised
-against the live box.
+DOCTOR_CAPTURE_RSS_ALERT_MB, NTFY_TOPIC, NTFY_URL, NTFY_FALLBACK_URL,
+NTFY_FALLBACK_TOPIC; DOCTOR_STATE_FILE and DOCTOR_ENV_FILE relocate the state
+file and .env so a copy can be exercised against the live box.
 """
 
 import argparse
@@ -58,6 +64,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -184,19 +191,51 @@ def log(msg: str):
     print(f'{datetime.now():%Y-%m-%d %H:%M:%S} {msg}', flush=True)
 
 
-def notify(title: str, message: str):
+def _push(base: str, topic: str, title: str, message: str, timeout: float = 10):
+    req = urllib.request.Request(f'{base.rstrip("/")}/{topic}', data=message.encode(), headers={'Title': title})
+    urllib.request.urlopen(req, timeout=timeout).read()
+
+
+def describe_error(exc: Exception) -> str:
+    """One line of diagnosis for a failed HTTP call."""
+    if isinstance(exc, urllib.error.HTTPError):
+        body = ''
+        with suppress(Exception):
+            body = exc.read(200).decode(errors='replace').strip()
+        text = f'HTTP {exc.code} {exc.reason}'
+        return f'{text} {body[:120]}' if body.startswith('{') else text  # ntfy's JSON error, with its own code
+    reason = getattr(exc, 'reason', None) or exc  # URLError wraps the socket error
+    return f'{type(exc).__name__}: {str(reason)[:80]}'
+
+
+def notify(title: str, message: str) -> bool:
+    """Push via ntfy; False when nothing was delivered, so the caller can retry on a later run.
+
+    A push that fails on the primary server is retried on the fallback topic, public ntfy.sh by default:
+    pushes therefore never carry secrets."""
     if DRY_RUN:
         log(f'[dry-run] would push: {title}: {message}')
-        return
+        return True
     topic = os.environ.get('NTFY_TOPIC')
     if not topic:
-        return
-    base = os.environ.get('NTFY_URL', 'https://ntfy.sh').rstrip('/')
+        return True  # pushes are off: the log line is the alert, there is nothing to retry
+    primary = os.environ.get('NTFY_URL', 'https://ntfy.sh')
     try:
-        req = urllib.request.Request(f'{base}/{topic}', data=message.encode(), headers={'Title': title})
-        urllib.request.urlopen(req, timeout=10).read()
+        _push(primary, topic, title, message)
+        return True
     except Exception as exc:
-        log(f'notify failed: {type(exc).__name__}')
+        log(f'notify failed on {urlparse(primary).hostname}: {describe_error(exc)}')
+    fallback_topic = os.environ.get('NTFY_FALLBACK_TOPIC')
+    if not fallback_topic:
+        return False
+    fallback = os.environ.get('NTFY_FALLBACK_URL', 'https://ntfy.sh')
+    try:
+        _push(fallback, fallback_topic, title, message)
+    except Exception as exc:
+        log(f'notify failed on fallback {urlparse(fallback).hostname}: {describe_error(exc)}')
+        return False
+    log(f'notify: delivered via fallback {urlparse(fallback).hostname}')
+    return True
 
 
 def http_get(url: str, timeout: float = 10) -> bytes:
@@ -598,7 +637,7 @@ def link_transition(ls: dict, degraded: bool, now: float, hold_s: float = LINK_H
     """Hysteresis: (new link state, event), event in ('', 'degraded', 'recovered').
 
     'degraded' fires once the condition has held >= hold_s; 'recovered' once it has been clean >= hold_s
-    after a 'degraded'.
+    after a 'degraded'. bad_since resets on every clean run; degraded_since marks the episode's start.
     """
     ls = dict(ls)
     event = ''
@@ -609,6 +648,7 @@ def link_transition(ls: dict, degraded: bool, now: float, hold_s: float = LINK_H
             ls['bad_since'] = now
         if ls.get('status') != 'degraded' and now - ls['bad_since'] >= hold:
             ls['status'] = 'degraded'
+            ls['degraded_since'] = ls['bad_since']
             event = 'degraded'
     else:
         ls['bad_since'] = None
@@ -616,6 +656,7 @@ def link_transition(ls: dict, degraded: bool, now: float, hold_s: float = LINK_H
             ls['clean_since'] = now
         if ls.get('status') == 'degraded' and now - ls['clean_since'] >= hold:
             ls['status'] = 'ok'
+            ls['degraded_since'] = None
             event = 'recovered'
     return ls, event
 
@@ -627,13 +668,16 @@ def alert_due(alerts: dict, key: str, now: float, repeat: float = ALERT_REPEAT_S
 
 def alert(state: dict, key: str, title: str, message: str, now: float,
           repeat: float = ALERT_REPEAT_S, tag: str = '[frigate]') -> bool:
-    """Deduped push; True when it was actually sent (or would be, in dry-run)."""
+    """Deduped push; True when it went out (or would have, in dry-run). A push that could not be delivered
+    does not start the repeat window, so the next run retries it."""
     alerts = state.setdefault('frigate', {}).setdefault('alerts', {})
     if not alert_due(alerts, key, now, repeat):
         return False
-    alerts[key] = now
     log(f'{tag} ALERT {title}: {message}')
-    notify(title, message)
+    if not notify(title, message):
+        log(f'{tag} alert not delivered; the next run retries')
+        return False
+    alerts[key] = now
     return True
 
 
@@ -642,7 +686,7 @@ def alert(state: dict, key: str, title: str, message: str, now: float,
 # ---------------------------------------------------------------------------
 CAM_STATE_DEFAULTS = {'fails': 0, 'down_since': None, 'last_reboot': 0,
                       'notified': False, 'restream_fails': 0, 'reboot_skipped_at': 0}
-LINK_STATE_DEFAULTS = {'status': 'ok', 'bad_since': None, 'clean_since': None,
+LINK_STATE_DEFAULTS = {'status': 'ok', 'bad_since': None, 'clean_since': None, 'degraded_since': None,
                        'alerted': False, 'last': {}}
 FRIGATE_STATE_DEFAULTS = {'strikes': 0, 'restarts': [], 'frame_hash': {},
                           'alerts': {}, 'down_runs': 0, 'attribution': {}}
@@ -659,6 +703,8 @@ def normalise_state(state: dict) -> dict:
         ls = st.setdefault('link', {})
         for k, v in LINK_STATE_DEFAULTS.items():
             ls.setdefault(k, dict(v) if isinstance(v, dict) else v)
+        if ls['status'] == 'degraded' and ls['degraded_since'] is None:  # file predates degraded_since
+            ls['degraded_since'] = ls['bad_since']
     fs = state.setdefault('frigate', {})
     for k, v in FRIGATE_STATE_DEFAULTS.items():
         fs.setdefault(k, type(v)() if isinstance(v, (dict, list)) else v)
@@ -741,7 +787,7 @@ def measure_links(state: dict, alive: dict, now: float, verbose: bool) -> dict:
 def link_message(name: str, st: dict, now: float) -> str:
     last = st['link'].get('last', {})
     ip = cam_ip(CAMERAS[name])
-    since = st['link'].get('bad_since') or now
+    since = st['link'].get('degraded_since') or now
     parts = [f'{name} ({ip}) link degraded for {(now - since) / 60:.0f} min:']
     if last.get('loss_pct') is not None:
         parts.append(f"{last['loss_pct']:.0f}% ping loss,")
@@ -767,10 +813,6 @@ def update_link_state(state: dict, name: str, lh: dict, now: float):
     ls.setdefault('alerted', False)
     if event == 'degraded':
         log(f"[link] {name} DEGRADED for >= {LINK_HOLD_S // 60} min: " + '; '.join(lh['reasons']))
-        if not st['down_since']:  # the camera layer already pushed DOWN for a dead camera
-            st['link'] = ls
-            ls['alerted'] = alert(state, f'link_{name}', f'VisionBox: {name} link degraded',
-                                  link_message(name, st, now), now, repeat=LINK_ALERT_REPEAT_S, tag='[link]')
     elif event == 'recovered':
         last = ls.get('last', {})
         log(f'[link] {name} link recovered (clean for >= {LINK_HOLD_S // 60} min)')
@@ -781,6 +823,11 @@ def update_link_state(state: dict, name: str, lh: dict, now: float):
                    f"{last.get('rtt_avg_ms') or 0:.0f} ms). Do: nothing.")
         ls['alerted'] = False
     st['link'] = ls
+    # One push per episode. A push the transition could not send (delivery failed, repeat window still open)
+    # stays pending while the link is degraded. A dead camera was already pushed DOWN by the camera layer.
+    if ls['status'] == 'degraded' and lh['degraded'] and not ls['alerted'] and not st['down_since']:
+        ls['alerted'] = alert(state, f'link_{name}', f'VisionBox: {name} link degraded',
+                              link_message(name, st, now), now, repeat=LINK_ALERT_REPEAT_S, tag='[link]')
     # A restream that has failed FAILS_BEFORE_DOWN runs is only Frigate's fault when the camera's link is clean.
     if st['restream_fails'] == FAILS_BEFORE_DOWN:
         if lh['degraded']:

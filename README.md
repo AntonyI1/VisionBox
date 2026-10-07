@@ -215,7 +215,9 @@ journalctl -u visionbox.service -f
 - Attributes every per-camera symptom to the camera link (ping loss/RTT, go2rtc producer state)
   or to the pipeline before acting, so a flaky WiFi camera never triggers a Frigate restart.
 
-Alerts need `NTFY_TOPIC` (and optionally `NTFY_URL`) in `.env`; `FRIGATE_*` and `DOCTOR_*` tunables
+Alerts need `NTFY_TOPIC` (and optionally `NTFY_URL`) in `.env`; a push that fails there is retried on
+`NTFY_FALLBACK_URL`/`NTFY_FALLBACK_TOPIC` (a public ntfy.sh topic works: pushes carry no secrets), and
+an alert that could not be delivered is retried on the next run. `FRIGATE_*` and `DOCTOR_*` tunables
 are listed in the module docstring and in `.env.sample`. `--dry-run` prints the decisions without
 rebooting, restarting or notifying; `--verbose` prints every probe. The camera table (IPs, ONVIF
 ports, stream paths) is currently hardcoded at the top of the script.
