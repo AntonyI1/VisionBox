@@ -216,15 +216,16 @@ journalctl -u visionbox.service -f
   or to the pipeline before acting, so a flaky WiFi camera never triggers a Frigate restart.
 - Watches the tailnet with `tailscale status` every run: an expired or logged-out node key is
   pushed at once, any other non-Running state after two runs, a recovery once, and a key expiring
-  within 14 days once a day.
+  within 14 days once a day. With `DOCTOR_PUBLIC_URL` set it also fetches the proxied Frigate URL
+  end to end while the box itself is healthy, so a dead proxy host is reported too.
 
 Alerts need `NTFY_TOPIC` (and optionally `NTFY_URL`) in `.env`; a push that fails there is retried on
 `NTFY_FALLBACK_URL`/`NTFY_FALLBACK_TOPIC` (a public ntfy.sh topic works: pushes carry no secrets), and
-an alert that could not be delivered is retried on the next run. `DOCTOR_FRIGATE_LAN_URL` is the LAN
-address quoted in tailnet pushes; `FRIGATE_*` and `DOCTOR_*` tunables are listed in the module
-docstring and in `.env.sample`. `--dry-run` prints the decisions without rebooting, restarting or
-notifying; `--verbose` prints every probe. The camera table (IPs, ONVIF ports, stream paths) is
-currently hardcoded at the top of the script.
+an alert that could not be delivered is retried on the next run. `DOCTOR_PUBLIC_URL` is the proxied
+URL to probe and `DOCTOR_FRIGATE_LAN_URL` the LAN address quoted in tailnet pushes; `FRIGATE_*` and
+`DOCTOR_*` tunables are listed in the module docstring and in `.env.sample`. `--dry-run` prints the
+decisions without rebooting, restarting or notifying; `--verbose` prints every probe. The camera
+table (IPs, ONVIF ports, stream paths) is currently hardcoded at the top of the script.
 
 ### Network hardening
 

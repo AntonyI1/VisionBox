@@ -41,7 +41,9 @@ node key looks like "Frigate is down" with Frigate fine and no push arriving.
 logout, which never clears on its own) is pushed at once, any other
 non-Running state after TS_STRIKES runs so the daemon's restart during its
 auto-update cannot cry wolf, and a key expiring within
-DOCTOR_TS_EXPIRY_WARN_DAYS is pushed daily.
+DOCTOR_TS_EXPIRY_WARN_DAYS is pushed daily. DOCTOR_PUBLIC_URL, the proxied
+Frigate URL, is probed end to end while the box itself is healthy, so a dead
+proxy host or proxy tailnet path is reported too.
 
 Pushes. The self-hosted ntfy server lives on the tailnet, so it is unreachable
 exactly when this box falls off it: a push that fails on NTFY_URL is retried
@@ -57,10 +59,10 @@ DOCTOR_WIRED_CAMERAS, DOCTOR_LINK_LOSS_PCT, DOCTOR_LINK_RTT_MS,
 DOCTOR_LINK_HOLD_S, DOCTOR_LINK_ALERT_REPEAT_S, DOCTOR_PRODUCER_SAMPLE_S,
 DOCTOR_PRODUCER_MIN_BPS, DOCTOR_PING_COUNT, DOCTOR_HUMAN_REPEAT_S,
 DOCTOR_CAPTURE_RSS_ALERT_MB, DOCTOR_TS_EXPIRY_WARN_DAYS,
-DOCTOR_TS_ALERT_REPEAT_S, DOCTOR_FRIGATE_LAN_URL, NTFY_TOPIC, NTFY_URL,
-NTFY_FALLBACK_URL, NTFY_FALLBACK_TOPIC; DOCTOR_STATE_FILE and DOCTOR_ENV_FILE
-relocate the state file and .env so a copy can be exercised against the live
-box.
+DOCTOR_TS_ALERT_REPEAT_S, DOCTOR_FRIGATE_LAN_URL, DOCTOR_PUBLIC_URL,
+NTFY_TOPIC, NTFY_URL, NTFY_FALLBACK_URL, NTFY_FALLBACK_TOPIC; DOCTOR_STATE_FILE
+and DOCTOR_ENV_FILE relocate the state file and .env so a copy can be
+exercised against the live box.
 """
 
 import argparse
@@ -185,6 +187,8 @@ TS_STRIKES = 2                   # runs of a non-Running state other than NeedsL
 TS_ALERT_REPEAT_S = int(os.environ.get('DOCTOR_TS_ALERT_REPEAT_S', str(6 * 3600)))
 TS_EXPIRY_WARN_S = float(os.environ.get('DOCTOR_TS_EXPIRY_WARN_DAYS', '14')) * 86400
 TS_EXPIRY_REPEAT_S = 24 * 3600   # one reminder a day while the node key is about to expire
+URL_STRIKES = 2                  # runs the proxied URL must fail before it is pushed
+PUBLIC_URL = os.environ.get('DOCTOR_PUBLIC_URL', '')            # proxied Frigate URL, probed end to end ('' = off)
 FRIGATE_LAN_URL = os.environ.get('DOCTOR_FRIGATE_LAN_URL', '')  # LAN address quoted in pushes ('' = omit)
 
 RTSP_STATUS_RE = re.compile(rb'^RTSP/1\.0 (\d{3})')
@@ -712,6 +716,7 @@ LINK_STATE_DEFAULTS = {'status': 'ok', 'bad_since': None, 'clean_since': None, '
 FRIGATE_STATE_DEFAULTS = {'strikes': 0, 'restarts': [], 'frame_hash': {},
                           'alerts': {}, 'down_runs': 0, 'attribution': {}}
 TS_STATE_DEFAULTS = {'state': 'Running', 'bad_runs': 0, 'alerted': False}
+URL_STATE_DEFAULTS = {'fails': 0, 'alerted': False}
 
 
 def normalise_state(state: dict) -> dict:
@@ -732,9 +737,10 @@ def normalise_state(state: dict) -> dict:
         fs.setdefault(k, type(v)() if isinstance(v, (dict, list)) else v)
     # the old 'budget' alert became the 6-h 'needs_human' one; carry its timestamp over
     fs['alerts'].setdefault('needs_human', fs['alerts'].get('budget', 0))
-    ts = state.setdefault('tailscale', {})
-    for k, v in TS_STATE_DEFAULTS.items():
-        ts.setdefault(k, v)
+    for key, defaults in (('tailscale', TS_STATE_DEFAULTS), ('public_url', URL_STATE_DEFAULTS)):
+        sub = state.setdefault(key, {})
+        for k, v in defaults.items():
+            sub.setdefault(k, v)
     return state
 
 
@@ -1226,8 +1232,9 @@ def tailnet_down_message(backend: str) -> str:
     else:
         why = 'the daemon is not answering' if backend == 'Unreachable' else f'it is stuck in state {backend}'
         todo = f'SSH to {HOST} and check `tailscale status` and `systemctl status tailscaled`.'
-    return (f'Tailscale on {HOST} is {backend} ({why}): the box is off the tailnet, so everything proxied to it '
-            f'and the usual ntfy pushes are dead while Frigate itself may be fine.{lan_note()} Do: {todo}')
+    proxied = f'{urlparse(PUBLIC_URL).hostname} and ' if PUBLIC_URL else 'everything proxied to it and '
+    return (f'Tailscale on {HOST} is {backend} ({why}): the box is off the tailnet, so {proxied}the usual ntfy '
+            f'pushes are dead while Frigate itself may be fine.{lan_note()} Do: {todo}')
 
 
 def check_tailscale(state: dict, now: float, verbose: bool) -> str:
@@ -1279,6 +1286,53 @@ def check_tailscale(state: dict, now: float, verbose: bool) -> str:
     return backend
 
 
+def probe_url(url: str, timeout: float = 10) -> str:
+    """'ok' for any answer that proves the path, an auth challenge included; otherwise a short failure text."""
+    try:
+        http_get(url, timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (401, 403):
+            return describe_error(exc)
+    except Exception as exc:
+        return describe_error(exc)
+    return 'ok'
+
+
+def check_public_url(state: dict, now: float, backend: str) -> str:
+    """Probe the proxied Frigate URL end to end, through the reverse proxy and the tailnet.
+
+    Judged only while this box is on the tailnet and its own Frigate answers (the other layers own those
+    cases), so a failure points at the proxy host or its tailnet path: pushed after URL_STRIKES consecutive
+    runs and once more when it is back. Off while DOCTOR_PUBLIC_URL is unset."""
+    us = state['public_url']
+    if not PUBLIC_URL or backend != 'Running':
+        return 'skipped'
+    try:
+        http_get(f'{FRIGATE_API}/api/version', 5)
+    except Exception:
+        return 'skipped'  # Frigate itself is down; the pipeline watchdog owns that
+    host = urlparse(PUBLIC_URL).hostname
+    res = probe_url(PUBLIC_URL)
+    if res == 'ok':
+        if us['alerted']:
+            log(f'[proxy] {host} answers again')
+            notify(f'VisionBox: {host} is back', f'{host} answers again from {HOST}. Do: nothing.')
+        us['fails'], us['alerted'] = 0, False
+        return res
+    us['fails'] += 1
+    if us['fails'] < URL_STRIKES:
+        log(f'[proxy] {host} not answering ({res}), {us["fails"]}/{URL_STRIKES}, waiting for the next run')
+        return res
+    log(f'[proxy] {host} not answering ({res}) for {us["fails"]} runs')
+    if alert(state, 'public_url', f'VisionBox: {host} is down',
+             f'{host} has not answered from {HOST} for {us["fails"]} runs ({res}) while Frigate and Tailscale on '
+             f'the box are fine, so the reverse proxy in front of it or its tailnet path is the problem.{lan_note()} '
+             f'Do: check the proxy host and its Tailscale (`tailscale status` there; its node key may have expired).',
+             now, repeat=TS_ALERT_REPEAT_S, tag='[proxy]'):
+        us['alerted'] = True
+    return res
+
+
 def trim_log():
     """Keep the cron-appended log bounded."""
     try:
@@ -1305,7 +1359,8 @@ def run(verbose: bool):
     except Exception as exc:  # the camera checks above must never be lost to a watchdog bug
         log(f'[frigate] watchdog error: {type(exc).__name__}: {exc}')
     try:
-        check_tailscale(state, now, verbose)
+        backend = check_tailscale(state, now, verbose)
+        check_public_url(state, now, backend)
     except Exception as exc:  # nor to a tailnet-check bug
         log(f'[tailscale] error: {type(exc).__name__}: {exc}')
 

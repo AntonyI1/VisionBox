@@ -372,6 +372,7 @@ class StateCompat(unittest.TestCase):
     def test_tailnet_keys_are_added_to_older_files(self):
         st = real_state()
         self.assertEqual(st['tailscale'], cd.TS_STATE_DEFAULTS)
+        self.assertEqual(st['public_url'], cd.URL_STATE_DEFAULTS)
         self.assertEqual(st['frigate']['alerts']['estale'], REAL_STATE['frigate']['alerts']['estale'])
 
 
@@ -1131,6 +1132,11 @@ class Tailnet(unittest.TestCase):
         self.assertNotIn('login.tailscale.com', msg)  # the public fallback topic must never carry it
         self.assertTrue(self.state['tailscale']['alerted'])
 
+    def test_down_push_names_the_proxied_host(self):
+        with patch.object(cd, 'PUBLIC_URL', 'https://frigate.example/api/version'):
+            self.check(ts_status('NeedsLogin'))
+        self.assertIn('so frigate.example and the usual ntfy pushes are dead', self.pushes[0][1])
+
     def test_down_push_repeats_only_after_the_interval(self):
         for i in range(4):
             self.check(ts_status('NeedsLogin'), NOW + 300 * i)
@@ -1192,6 +1198,99 @@ class Tailnet(unittest.TestCase):
                        ts_status('Running')):
             self.check(status)
         self.assertEqual(self.pushes, [])
+
+
+class PublicUrl(unittest.TestCase):
+    """check_public_url() probes the proxied Frigate URL only while the box itself is healthy."""
+
+    def setUp(self):
+        self.pushes = []
+        self.proxy, self.frigate_up = 200, True  # the proxied URL's HTTP status, None when nothing answers
+        self.orig = (cd.http_get, cd.notify, cd.PUBLIC_URL, cd.FRIGATE_LAN_URL)
+        cd.notify = pushes_into(self.pushes)
+        cd.PUBLIC_URL, cd.FRIGATE_LAN_URL = 'https://frigate.example/api/version', 'http://192.0.2.1:5000'
+
+        def fake_get(url, timeout=10):
+            if url.startswith(cd.FRIGATE_API):
+                if self.frigate_up:
+                    return b'0.17.1'
+                raise OSError('down')
+            if self.proxy is None:
+                raise urllib.error.URLError('timed out')
+            if self.proxy != 200:
+                raise urllib.error.HTTPError(url, self.proxy, 'nope', None, None)
+            return b'0.17.1'
+        cd.http_get = fake_get
+        self.state = cd.normalise_state({})
+
+    def tearDown(self):
+        cd.http_get, cd.notify, cd.PUBLIC_URL, cd.FRIGATE_LAN_URL = self.orig
+
+    def check(self, now=NOW, backend='Running'):
+        return cd.check_public_url(self.state, now, backend)
+
+    def test_two_failures_push_once_and_recovery_pushes_once(self):
+        self.proxy = None
+        self.assertEqual(self.check(), 'URLError: timed out')
+        self.assertEqual(self.pushes, [])
+        self.check(NOW + 300)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn('frigate.example is down', self.pushes[0][0])
+        self.assertIn('192.0.2.1:5000', self.pushes[0][1])
+        self.check(NOW + 600)
+        self.assertEqual(len(self.pushes), 1)
+        self.proxy = 200
+        self.check(NOW + 900)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertIn('is back', self.pushes[1][0])
+        self.assertEqual(self.state['public_url'], {'fails': 0, 'alerted': False})
+
+    def test_single_failure_is_forgotten(self):
+        for i, status in enumerate((None, 200, None)):
+            self.proxy = status
+            self.check(NOW + 300 * i)
+        self.assertEqual(self.pushes, [])
+
+    def test_skipped_while_off_the_tailnet_or_frigate_down(self):
+        self.proxy = None
+        for i in range(3):
+            self.assertEqual(self.check(NOW + 300 * i, 'NeedsLogin'), 'skipped')
+        self.frigate_up = False
+        self.assertEqual(self.check(NOW + 900), 'skipped')
+        self.assertEqual((self.pushes, self.state['public_url']['fails']), ([], 0))
+
+    def test_auth_challenge_proves_the_path_but_a_proxy_error_does_not(self):
+        for status in (401, 403):
+            self.proxy = status
+            self.assertEqual(self.check(), 'ok')
+        self.proxy = 502
+        self.assertEqual(self.check(NOW + 300), 'HTTP 502 nope')
+
+    def test_missing_or_broken_endpoint_raises_an_alert(self):
+        for status in (400, 404, 410, 429):
+            with self.subTest(status=status):
+                self.state = cd.normalise_state({})
+                self.pushes.clear()
+                self.proxy = status
+                self.assertEqual(self.check(), f'HTTP {status} nope')
+                self.assertEqual(self.check(NOW + 300), f'HTTP {status} nope')
+                self.assertEqual(len(self.pushes), 1)
+                self.assertTrue(self.state['public_url']['alerted'])
+
+    def test_failed_proxy_alert_is_retried_without_waiting_for_the_repeat_window(self):
+        self.proxy = None
+        self.check()
+        with patch.object(cd, 'notify', side_effect=[False, True]) as delivery:
+            self.check(NOW + 300)
+            self.assertFalse(self.state['public_url']['alerted'])
+            self.check(NOW + 600)
+            self.assertTrue(self.state['public_url']['alerted'])
+        self.assertEqual(delivery.call_count, 2)
+
+    def test_off_when_unconfigured(self):
+        cd.PUBLIC_URL = ''
+        self.proxy = None
+        self.assertEqual(self.check(), 'skipped')
 
 
 if __name__ == '__main__':
