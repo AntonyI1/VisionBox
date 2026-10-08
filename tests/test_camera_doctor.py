@@ -16,6 +16,7 @@ import time
 import unittest
 import urllib.error
 from contextlib import redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -367,6 +368,11 @@ class StateCompat(unittest.TestCase):
         st = cd.normalise_state({'backyard': {'link': {'status': 'degraded', 'bad_since': NOW - 3600}}})
         self.assertEqual(st['backyard']['link']['degraded_since'], NOW - 3600)
         self.assertIsNone(st['front_door']['link']['degraded_since'])
+
+    def test_tailnet_keys_are_added_to_older_files(self):
+        st = real_state()
+        self.assertEqual(st['tailscale'], cd.TS_STATE_DEFAULTS)
+        self.assertEqual(st['frigate']['alerts']['estale'], REAL_STATE['frigate']['alerts']['estale'])
 
 
 class AtomicState(unittest.TestCase):
@@ -1059,6 +1065,133 @@ class DescribeError(unittest.TestCase):
         self.assertEqual(cd.describe_error(urllib.error.URLError(OSError(111, 'Connection refused'))),
                          'URLError: [Errno 111] Connection refused')
         self.assertEqual(cd.describe_error(TimeoutError('timed out')), 'TimeoutError: timed out')
+
+
+def ts_status(backend, expiry=None, auth_url=None):
+    status = {'BackendState': backend, 'Self': {}}
+    if expiry is not None:
+        status['Self']['KeyExpiry'] = expiry
+    if auth_url:
+        status['AuthURL'] = auth_url
+    return status
+
+
+def iso_z(ts):
+    return datetime.fromtimestamp(ts, UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+class Tailnet(unittest.TestCase):
+    """check_tailscale() with `tailscale status --json` stubbed."""
+    FAR = iso_z(NOW + 170 * 86400)
+
+    def setUp(self):
+        self.pushes = []
+        self.orig = (cd.notify, cd.tailscale_status, cd.FRIGATE_LAN_URL)
+        cd.notify = pushes_into(self.pushes)
+        cd.FRIGATE_LAN_URL = 'http://192.0.2.1:5000'
+        self.state = cd.normalise_state({})
+
+    def tearDown(self):
+        cd.notify, cd.tailscale_status, cd.FRIGATE_LAN_URL = self.orig
+
+    def check(self, status, now=NOW):
+        cd.tailscale_status = lambda: status
+        return cd.check_tailscale(self.state, now, False)
+
+    def test_status_command_failures(self):
+        def status_with(**run):
+            with patch.object(cd.subprocess, 'run', **run):
+                return cd.tailscale_status()
+
+        self.assertIsNone(status_with(side_effect=FileNotFoundError))
+        self.assertEqual(status_with(side_effect=subprocess.TimeoutExpired('tailscale', 20)),
+                         {'BackendState': 'Unreachable'})
+        self.assertEqual(status_with(return_value=subprocess.CompletedProcess([], 1, '', 'no daemon')),
+                         {'BackendState': 'Unreachable'})
+        self.assertEqual(status_with(return_value=subprocess.CompletedProcess([], 0, '{"BackendState": "x"}')),
+                         {'BackendState': 'x'})
+
+    def test_key_expiry_parsing(self):
+        self.assertIsNone(cd.parse_key_expiry(None))
+        self.assertIsNone(cd.parse_key_expiry(''))
+        self.assertIsNone(cd.parse_key_expiry('0001-01-01T00:00:00Z'))  # expiry disabled in the admin console
+        self.assertIsNone(cd.parse_key_expiry('soon'))
+        self.assertEqual(cd.parse_key_expiry('2027-04-04T06:38:20Z'), 1806820700.0)
+        self.assertAlmostEqual(cd.parse_key_expiry('2027-04-04T06:38:20.123456789Z'), 1806820700.123456, places=3)
+
+    def test_needs_login_is_pushed_at_once_without_the_login_link(self):
+        status = ts_status('NeedsLogin', auth_url='https://login.tailscale.com/a/secret')
+        self.assertEqual(self.check(status), 'NeedsLogin')
+        self.assertEqual(len(self.pushes), 1)
+        title, msg = self.pushes[0]
+        self.assertIn('off the tailnet', title)
+        self.assertIn('NeedsLogin', msg)
+        self.assertIn('sudo tailscale login', msg)
+        self.assertIn('192.0.2.1:5000', msg)
+        self.assertNotIn('login.tailscale.com', msg)  # the public fallback topic must never carry it
+        self.assertTrue(self.state['tailscale']['alerted'])
+
+    def test_down_push_repeats_only_after_the_interval(self):
+        for i in range(4):
+            self.check(ts_status('NeedsLogin'), NOW + 300 * i)
+        self.assertEqual(len(self.pushes), 1)
+        self.check(ts_status('NeedsLogin'), NOW + cd.TS_ALERT_REPEAT_S)
+        self.assertEqual(len(self.pushes), 2)
+
+    def test_failed_delivery_stays_unalerted_and_is_retried(self):
+        with patch.object(cd, 'notify', side_effect=[False, True]) as delivery:
+            self.check(ts_status('NeedsLogin'))
+            self.assertFalse(self.state['tailscale']['alerted'])
+            self.check(ts_status('NeedsLogin'), NOW + 300)
+            self.assertTrue(self.state['tailscale']['alerted'])
+            self.check(ts_status('NeedsLogin'), NOW + 600)
+        self.assertEqual(delivery.call_count, 2)
+
+    def test_recovery_is_pushed_once(self):
+        self.check(ts_status('NeedsLogin'))
+        self.check(ts_status('Running', self.FAR), NOW + 600)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertIn('back on the tailnet', self.pushes[1][0])
+        self.assertEqual((self.state['tailscale']['alerted'], self.state['tailscale']['bad_runs']), (False, 0))
+        self.check(ts_status('Running', self.FAR), NOW + 900)
+        self.assertEqual(len(self.pushes), 2)
+
+    def test_other_states_need_two_consecutive_runs(self):
+        self.check(ts_status('Starting'))
+        self.check(ts_status('Running', self.FAR), NOW + 300)  # the daemon restarted for an auto-update
+        self.assertEqual(self.pushes, [])
+        self.check(ts_status('Starting'), NOW + 600)
+        self.assertEqual(self.pushes, [])
+        self.check(ts_status('Starting'), NOW + 900)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_unreachable_daemon_counts_as_down(self):
+        for i in range(2):
+            self.check({'BackendState': 'Unreachable'}, NOW + 300 * i)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn('not answering', self.pushes[0][1])
+
+    def test_no_cli_is_silent(self):
+        self.assertEqual(self.check(None), 'Unavailable')
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.state['tailscale']['bad_runs'], 0)
+
+    def test_expiry_warning_is_daily_inside_the_window(self):
+        soon = ts_status('Running', iso_z(NOW + 5 * 86400 + 60))
+        self.check(soon)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn('expires in 5 days', self.pushes[0][0])
+        self.assertIn('Disable key expiry', self.pushes[0][1])
+        self.check(soon, NOW + 3600)
+        self.assertEqual(len(self.pushes), 1)
+        self.check(soon, NOW + cd.TS_EXPIRY_REPEAT_S)
+        self.assertEqual(len(self.pushes), 2)
+
+    def test_far_or_disabled_expiry_is_quiet(self):
+        for status in (ts_status('Running', self.FAR), ts_status('Running', '0001-01-01T00:00:00Z'),
+                       ts_status('Running')):
+            self.check(status)
+        self.assertEqual(self.pushes, [])
 
 
 if __name__ == '__main__':

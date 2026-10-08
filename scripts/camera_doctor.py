@@ -33,6 +33,16 @@ per camera once the condition has held LINK_HOLD_S and one "link recovered"
 push after as long clean. Only a symptom on a demonstrably healthy link is a
 pipeline strike.
 
+Tailnet. Everything the household uses reaches this box over Tailscale: the
+reverse proxy behind the public Frigate hostname forwards to the box's tailnet
+IP and the self-hosted ntfy server lives on the tailnet too, so an expired
+node key looks like "Frigate is down" with Frigate fine and no push arriving.
+`tailscale status --json` is read every run: NeedsLogin (an expired key or a
+logout, which never clears on its own) is pushed at once, any other
+non-Running state after TS_STRIKES runs so the daemon's restart during its
+auto-update cannot cry wolf, and a key expiring within
+DOCTOR_TS_EXPIRY_WARN_DAYS is pushed daily.
+
 Pushes. The self-hosted ntfy server lives on the tailnet, so it is unreachable
 exactly when this box falls off it: a push that fails on NTFY_URL is retried
 on NTFY_FALLBACK_URL/NTFY_FALLBACK_TOPIC, a public ntfy.sh topic by default,
@@ -46,9 +56,11 @@ FRIGATE_NFS_MOUNT, DOCTOR_WARMUP_S, DOCTOR_RESTART_COOLDOWN_S,
 DOCTOR_WIRED_CAMERAS, DOCTOR_LINK_LOSS_PCT, DOCTOR_LINK_RTT_MS,
 DOCTOR_LINK_HOLD_S, DOCTOR_LINK_ALERT_REPEAT_S, DOCTOR_PRODUCER_SAMPLE_S,
 DOCTOR_PRODUCER_MIN_BPS, DOCTOR_PING_COUNT, DOCTOR_HUMAN_REPEAT_S,
-DOCTOR_CAPTURE_RSS_ALERT_MB, NTFY_TOPIC, NTFY_URL, NTFY_FALLBACK_URL,
-NTFY_FALLBACK_TOPIC; DOCTOR_STATE_FILE and DOCTOR_ENV_FILE relocate the state
-file and .env so a copy can be exercised against the live box.
+DOCTOR_CAPTURE_RSS_ALERT_MB, DOCTOR_TS_EXPIRY_WARN_DAYS,
+DOCTOR_TS_ALERT_REPEAT_S, DOCTOR_FRIGATE_LAN_URL, NTFY_TOPIC, NTFY_URL,
+NTFY_FALLBACK_URL, NTFY_FALLBACK_TOPIC; DOCTOR_STATE_FILE and DOCTOR_ENV_FILE
+relocate the state file and .env so a copy can be exercised against the live
+box.
 """
 
 import argparse
@@ -165,6 +177,15 @@ LINK_ALERT_REPEAT_S = int(os.environ.get('DOCTOR_LINK_ALERT_REPEAT_S', str(6 * 3
 PRODUCER_SAMPLE_S = float(os.environ.get('DOCTOR_PRODUCER_SAMPLE_S', '6'))
 PRODUCER_MIN_BPS = float(os.environ.get('DOCTOR_PRODUCER_MIN_BPS', '1000'))
 PING_COUNT = int(os.environ.get('DOCTOR_PING_COUNT', '10'))
+
+# Tailnet: the reverse proxy and the ntfy server both reach this box over Tailscale.
+TAILSCALE = '/usr/bin/tailscale'
+HOST = socket.gethostname()
+TS_STRIKES = 2                   # runs of a non-Running state other than NeedsLogin before it is pushed
+TS_ALERT_REPEAT_S = int(os.environ.get('DOCTOR_TS_ALERT_REPEAT_S', str(6 * 3600)))
+TS_EXPIRY_WARN_S = float(os.environ.get('DOCTOR_TS_EXPIRY_WARN_DAYS', '14')) * 86400
+TS_EXPIRY_REPEAT_S = 24 * 3600   # one reminder a day while the node key is about to expire
+FRIGATE_LAN_URL = os.environ.get('DOCTOR_FRIGATE_LAN_URL', '')  # LAN address quoted in pushes ('' = omit)
 
 RTSP_STATUS_RE = re.compile(rb'^RTSP/1\.0 (\d{3})')
 TS_RE = re.compile(r'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)')
@@ -690,6 +711,7 @@ LINK_STATE_DEFAULTS = {'status': 'ok', 'bad_since': None, 'clean_since': None, '
                        'alerted': False, 'last': {}}
 FRIGATE_STATE_DEFAULTS = {'strikes': 0, 'restarts': [], 'frame_hash': {},
                           'alerts': {}, 'down_runs': 0, 'attribution': {}}
+TS_STATE_DEFAULTS = {'state': 'Running', 'bad_runs': 0, 'alerted': False}
 
 
 def normalise_state(state: dict) -> dict:
@@ -710,6 +732,9 @@ def normalise_state(state: dict) -> dict:
         fs.setdefault(k, type(v)() if isinstance(v, (dict, list)) else v)
     # the old 'budget' alert became the 6-h 'needs_human' one; carry its timestamp over
     fs['alerts'].setdefault('needs_human', fs['alerts'].get('budget', 0))
+    ts = state.setdefault('tailscale', {})
+    for k, v in TS_STATE_DEFAULTS.items():
+        ts.setdefault(k, v)
     return state
 
 
@@ -1160,6 +1185,100 @@ def reboot_cameras(state: dict, names: list, now: float):
         log(f'[{name}] ONVIF reboot attempt: {result}')
 
 
+# ---------------------------------------------------------------------------
+# Tailnet
+# ---------------------------------------------------------------------------
+def tailscale_status() -> dict | None:
+    """`tailscale status --json`; {'BackendState': 'Unreachable'} when the daemon does not answer, None when
+    the CLI is not installed."""
+    try:
+        res = subprocess.run([TAILSCALE, 'status', '--json'], capture_output=True, text=True, timeout=20, check=False)
+    except FileNotFoundError:
+        return None
+    except (OSError, subprocess.SubprocessError):
+        return {'BackendState': 'Unreachable'}
+    try:
+        status = json.loads(res.stdout)
+    except ValueError:
+        return {'BackendState': 'Unreachable'}
+    return status if isinstance(status, dict) else {'BackendState': 'Unreachable'}
+
+
+def parse_key_expiry(value) -> float | None:
+    """Self.KeyExpiry as epoch seconds; None when expiry is disabled (absent or Go's zero time) or unparsable."""
+    if not value or str(value).startswith('0001-'):
+        return None
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except ValueError:
+        return None
+
+
+def lan_note() -> str:
+    return f' Frigate stays reachable on the LAN at {FRIGATE_LAN_URL}.' if FRIGATE_LAN_URL else ''
+
+
+def tailnet_down_message(backend: str) -> str:
+    if backend == 'NeedsLogin':
+        why = 'its node key expired or it was logged out'
+        todo = (f'SSH to {HOST}, run `sudo tailscale login`, open the link it prints and sign in; then disable key '
+                f'expiry for this machine in the Tailscale admin console so it cannot recur.')
+    else:
+        why = 'the daemon is not answering' if backend == 'Unreachable' else f'it is stuck in state {backend}'
+        todo = f'SSH to {HOST} and check `tailscale status` and `systemctl status tailscaled`.'
+    return (f'Tailscale on {HOST} is {backend} ({why}): the box is off the tailnet, so everything proxied to it '
+            f'and the usual ntfy pushes are dead while Frigate itself may be fine.{lan_note()} Do: {todo}')
+
+
+def check_tailscale(state: dict, now: float, verbose: bool) -> str:
+    """Push when this box is off the tailnet or its node key is about to expire; returns the backend state.
+
+    NeedsLogin (an expired node key or a logout) never clears on its own and is pushed at once; any other
+    non-Running state only after TS_STRIKES runs, so the daemon's restart during its auto-update cannot cry
+    wolf. A recovery is pushed once. While Running, a key expiring within TS_EXPIRY_WARN_S is pushed daily."""
+    ts = state['tailscale']
+    status = tailscale_status()
+    if status is None:
+        ts['state'] = 'Unavailable'
+        return 'Unavailable'  # no tailscale CLI on this box: nothing to watch
+    backend = status.get('BackendState') or 'NoState'
+    me = status.get('Self') or {}
+    ts['state'] = backend
+    if verbose:
+        log(f"[tailscale] state {backend}, key expiry {me.get('KeyExpiry')}")
+    if backend != 'Running':
+        ts['bad_runs'] += 1
+        if backend != 'NeedsLogin' and ts['bad_runs'] < TS_STRIKES:
+            log(f'[tailscale] state {backend} ({ts["bad_runs"]}/{TS_STRIKES}), waiting for the next run')
+            return backend
+        log(f'[tailscale] {HOST} is off the tailnet: state {backend}')
+        if status.get('AuthURL'):
+            log(f"[tailscale] pending login link: {status['AuthURL']}")  # local log only, never pushed
+        if alert(state, 'tailscale_down', f'VisionBox: {HOST} is off the tailnet', tailnet_down_message(backend),
+                 now, repeat=TS_ALERT_REPEAT_S, tag='[tailscale]'):
+            ts['alerted'] = True
+        return backend
+    if ts['alerted'] or ts['bad_runs']:
+        log('[tailscale] back on the tailnet')
+    if ts['alerted']:
+        notify(f'VisionBox: {HOST} is back on the tailnet',
+               f'Tailscale on {HOST} is Running again; everything proxied to it and the usual ntfy pushes work '
+               f'again. Do: if this was a key expiry, disable key expiry for this machine in the Tailscale admin '
+               f'console.')
+    ts['bad_runs'], ts['alerted'] = 0, False
+    expiry = parse_key_expiry(me.get('KeyExpiry'))
+    if expiry is not None and expiry - now < TS_EXPIRY_WARN_S:
+        days = max(0, int((expiry - now) // 86400))
+        alert(state, 'tailscale_expiry',
+              f"VisionBox: Tailscale key on {HOST} expires in {days} day{'s' if days != 1 else ''}",
+              f'The Tailscale node key on {HOST} expires on {datetime.fromtimestamp(expiry, UTC):%Y-%m-%d}. When it '
+              f'does, the box drops off the tailnet and everything proxied to it goes dark while Frigate keeps '
+              f'running. Do: Tailscale admin console -> Machines -> {HOST} -> Disable key expiry; or '
+              f'`sudo tailscale login` on the box to renew it.',
+              now, repeat=TS_EXPIRY_REPEAT_S, tag='[tailscale]')
+    return backend
+
+
 def trim_log():
     """Keep the cron-appended log bounded."""
     try:
@@ -1185,6 +1304,10 @@ def run(verbose: bool):
         frigate_watchdog(state, restream_up, now, verbose, link)
     except Exception as exc:  # the camera checks above must never be lost to a watchdog bug
         log(f'[frigate] watchdog error: {type(exc).__name__}: {exc}')
+    try:
+        check_tailscale(state, now, verbose)
+    except Exception as exc:  # nor to a tailnet-check bug
+        log(f'[tailscale] error: {type(exc).__name__}: {exc}')
 
     save_state(state)
     trim_log()
