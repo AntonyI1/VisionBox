@@ -24,6 +24,15 @@ HERE = Path(__file__).resolve().parent
 _TMP = tempfile.mkdtemp(prefix='camera_doctor_test_')
 os.environ.setdefault('DOCTOR_STATE_FILE', str(Path(_TMP) / 'test_state.json'))
 os.environ.setdefault('DOCTOR_ENV_FILE', '/nonexistent/.env')  # the tests must not need credentials
+os.environ.update({  # the camera table, with documentation addresses
+    'DOCTOR_CAMERAS': 'front_door,front_garage,backyard,backyard_gate',
+    'DOCTOR_CAMERA_FRONT_DOOR_RTSP': 'rtsp://u:p@192.0.2.10:554/stream1',
+    'DOCTOR_CAMERA_FRONT_DOOR_RESTREAM': 'front_door_sub',
+    'DOCTOR_CAMERA_FRONT_GARAGE_RTSP': 'rtsp://u:p@192.0.2.11:554/stream2',
+    'DOCTOR_CAMERA_FRONT_GARAGE_ONVIF': '192.0.2.11:8080',
+    'DOCTOR_CAMERA_BACKYARD_RTSP': 'rtsp://u:p@192.0.2.12:554/stream1',
+    'DOCTOR_CAMERA_BACKYARD_GATE_RTSP': 'rtsp://u:p@192.0.2.13:554/stream1',
+})
 spec = importlib.util.spec_from_file_location('camera_doctor', HERE.parent / 'scripts' / 'camera_doctor.py')
 cd = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cd)
@@ -414,7 +423,50 @@ class AtomicState(unittest.TestCase):
         self.assertEqual(self.files(), [self.target])
 
 
+CAMERA_TABLE_ENV = {'DOCTOR_CAMERAS': 'porch, shed,,', 'DOCTOR_CAMERA_PORCH_RTSP': 'rtsp://u:p%40ss@192.0.2.30:554/live',
+                    'DOCTOR_CAMERA_SHED_RTSP': 'rtsp://a:b@192.0.2.31/x', 'DOCTOR_CAMERA_SHED_RESTREAM': 'shed_sub',
+                    'DOCTOR_CAMERA_SHED_ONVIF': '192.0.2.31:8080'}
+
+
+class CameraTable(unittest.TestCase):
+    def test_table_from_env(self):
+        with patch.dict(os.environ, CAMERA_TABLE_ENV):
+            table = cd._camera_table()
+        self.assertEqual(list(table), ['porch', 'shed'])
+        self.assertEqual(table['porch'], {'rtsp': 'rtsp://u:p%40ss@192.0.2.30:554/live', 'restream': 'porch',
+                                          'onvif': ('192.0.2.30', 80, 'u', 'p%40ss')})
+        self.assertEqual(table['shed']['restream'], 'shed_sub')
+        self.assertEqual(table['shed']['onvif'], ('192.0.2.31', 8080, 'a', 'b'))
+
+    def test_camera_without_rtsp_is_skipped(self):
+        env = {'DOCTOR_CAMERAS': 'porch,gate', 'DOCTOR_CAMERA_PORCH_RTSP': 'rtsp://u:p@192.0.2.30/live'}
+        with patch.dict(os.environ, env), redirect_stdout(io.StringIO()) as out:
+            table = cd._camera_table()
+        self.assertEqual(list(table), ['porch'])
+        self.assertIn('DOCTOR_CAMERA_GATE_RTSP', out.getvalue())
+
+    def test_no_configuration_means_no_cameras(self):
+        with patch.dict(os.environ, {'DOCTOR_CAMERAS': ''}):
+            self.assertEqual(cd._camera_table(), {})
+
+
 class EnvFile(unittest.TestCase):
+    def test_stdlib_parser_expands_references(self):
+        path = Path(_TMP) / 'expand.env'
+        path.write_text('DOCTOR_T_PASS=s3cret\nDOCTOR_T_URL=rtsp://u:${DOCTOR_T_PASS}@192.0.2.40/x\n'
+                        'DOCTOR_T_FROM_ENV=${DOCTOR_T_PRESET}/x\n')
+        os.environ['DOCTOR_T_PRESET'] = 'env'
+        orig = cd.load_dotenv
+        cd.load_dotenv = None
+        try:
+            cd._load_env_file(path)
+            self.assertEqual(os.environ['DOCTOR_T_URL'], 'rtsp://u:s3cret@192.0.2.40/x')
+            self.assertEqual(os.environ['DOCTOR_T_FROM_ENV'], 'env/x')
+        finally:
+            cd.load_dotenv = orig
+            for k in ('DOCTOR_T_PASS', 'DOCTOR_T_URL', 'DOCTOR_T_FROM_ENV', 'DOCTOR_T_PRESET'):
+                os.environ.pop(k, None)
+
     def test_stdlib_parser_never_overrides_the_environment(self):
         path = Path(_TMP) / 'parse.env'
         path.write_text('# comment\nexport DOCTOR_T_A="quoted"\nDOCTOR_T_B = plain \nDOCTOR_T_C=file\nnot a pair\n')
@@ -459,7 +511,8 @@ class LogParsers(unittest.TestCase):
     def test_parse_go2rtc_log(self):
         ipmap = {'192.0.2.11': 'front_garage', '192.0.2.12': 'backyard'}
         since = cd.datetime(2026, 9, 13, 18, 0, tzinfo=cd.UTC).timestamp()
-        backyard_line = GO2RTC_LINE.replace('249', '101').replace('i/o timeout', 'RTP header size insufficient')
+        backyard_line = (GO2RTC_LINE.replace('192.0.2.11', '192.0.2.12')
+                         .replace('i/o timeout', 'RTP header size insufficient'))
         g = cd.parse_go2rtc_log([GO2RTC_LINE, backyard_line,
                                  '2026-09-13 17:15:11.7  10:15:11.748 INF go2rtc platform=linux/amd64'], since, ipmap)
         self.assertEqual(g['timeouts'], {'front_garage': 1, 'backyard': 1})

@@ -73,7 +73,7 @@ cameras:
     url:        rtsp://127.0.0.1:8554/front_door       # recorded stream
     detect_url: rtsp://127.0.0.1:8554/front_door_sub   # optional lower-res stream for motion + detection
   backyard:
-    url: rtsp://${CAM_USER}:${CAM_PASS}@192.0.2.12:554/stream1
+    url: rtsp://${CAM_USER}:${CAM_PASS}@<camera-ip>:554/stream1
     enabled: false                                     # keep the entry, skip the camera
     # test_input: samples/backyard.mp4                 # replace the stream with a file for offline testing
 
@@ -224,8 +224,9 @@ Alerts need `NTFY_TOPIC` (and optionally `NTFY_URL`) in `.env`; a push that fail
 an alert that could not be delivered is retried on the next run. `DOCTOR_PUBLIC_URL` is the proxied
 URL to probe and `DOCTOR_FRIGATE_LAN_URL` the LAN address quoted in tailnet pushes; `FRIGATE_*` and
 `DOCTOR_*` tunables are listed in the module docstring and in `.env.sample`. `--dry-run` prints the
-decisions without rebooting, restarting or notifying; `--verbose` prints every probe. The camera
-table (IPs, ONVIF ports, stream paths) is currently hardcoded at the top of the script.
+decisions without rebooting, restarting or notifying; `--verbose` prints every probe. The cameras it
+probes are defined in `.env`: `DOCTOR_CAMERAS` lists them and `DOCTOR_CAMERA_<NAME>_RTSP`,
+`_RESTREAM` and `_ONVIF` describe each one.
 
 ### Network hardening
 

@@ -8,7 +8,9 @@ for liveness (any RTSP status line, 401 included, counts as alive). A camera
 that fails FAILS_BEFORE_DOWN consecutive runs is declared DOWN, pushed via
 ntfy and sent an ONVIF SystemReboot at most once an hour, which heals a hung
 RTSP daemon. A camera that is unreachable or on a lossy link is not rebooted:
-the command could not arrive, or the radio is the problem.
+the command could not arrive, or the radio is the problem. The cameras come
+from .env: DOCTOR_CAMERAS names them and DOCTOR_CAMERA_<NAME>_RTSP, _RESTREAM
+and _ONVIF describe each one.
 
 Frigate pipeline. Only Frigate-internal liveness signals are watched, never
 motion or recording activity, so a quiet camera cannot trigger anything. A
@@ -53,7 +55,8 @@ at all is retried on the next run instead of starting its repeat window.
 
 Policy helpers are pure functions and are unit-tested directly. --dry-run
 prints every decision without restarting, rebooting or notifying. Tunables
-can be overridden from .env: FRIGATE_API, FRIGATE_CONTAINER,
+can be overridden from .env: DOCTOR_CAMERAS, DOCTOR_CAMERA_<NAME>_RTSP,
+DOCTOR_CAMERA_<NAME>_RESTREAM, DOCTOR_CAMERA_<NAME>_ONVIF, FRIGATE_API, FRIGATE_CONTAINER,
 FRIGATE_NFS_MOUNT, DOCTOR_WARMUP_S, DOCTOR_RESTART_COOLDOWN_S,
 DOCTOR_WIRED_CAMERAS, DOCTOR_LINK_LOSS_PCT, DOCTOR_LINK_RTT_MS,
 DOCTOR_LINK_HOLD_S, DOCTOR_LINK_ALERT_REPEAT_S, DOCTOR_PRODUCER_SAMPLE_S,
@@ -99,49 +102,25 @@ def _load_env_file(path: Path):
         load_dotenv(path)
         return
     try:
-        for raw in path.read_text().splitlines():
-            line = raw.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            key, _, value = line.removeprefix('export ').partition('=')
-            key, value = key.strip(), value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
-                value = value[1:-1]
-            os.environ.setdefault(key, value)
+        lines = path.read_text().splitlines()
     except OSError:
-        pass
+        return
+    values = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, _, value = line.removeprefix('export ').partition('=')
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+            value = value[1:-1]
+        values[key] = value
+    for key, value in values.items():  # ${NAME} references resolve as python-dotenv's do: environment first
+        values[key] = re.sub(r'\$\{(\w+)\}', lambda m: os.environ.get(m.group(1), values.get(m.group(1), '')), value)
+        os.environ.setdefault(key, values[key])
 
 
 _load_env_file(Path(os.environ.get('DOCTOR_ENV_FILE', ROOT / '.env')))
-
-CAM_USER = os.environ.get('CAM_USER', '')
-CAM_PASS = os.environ.get('CAM_PASS', '')
-ADMIN_PASS = os.environ.get('CAM_ADMIN_PASS', '')
-
-# rtsp: the camera's own endpoint, which isolates camera health from go2rtc/Frigate;
-# restream: the go2rtc stream Frigate and VisionBox consume; onvif: the SystemReboot target.
-CAMERAS = {
-    'front_door': {
-        'rtsp': f'rtsp://admin:{ADMIN_PASS}@192.0.2.10:554/stream1',
-        'restream': 'front_door_sub',
-        'onvif': ('192.0.2.10', 80, 'admin', ADMIN_PASS),
-    },
-    'front_garage': {
-        'rtsp': f'rtsp://{CAM_USER}:{CAM_PASS}@192.0.2.11:554/stream2',
-        'restream': 'front_garage',
-        'onvif': ('192.0.2.11', 80, CAM_USER, CAM_PASS),
-    },
-    'backyard': {
-        'rtsp': f'rtsp://{CAM_USER}:{CAM_PASS}@192.0.2.12:554/stream1',
-        'restream': 'backyard',
-        'onvif': ('192.0.2.12', 80, CAM_USER, CAM_PASS),
-    },
-    'backyard_gate': {
-        'rtsp': f'rtsp://{CAM_USER}:{CAM_PASS}@192.0.2.13:554/stream1',
-        'restream': 'backyard_gate',
-        'onvif': ('192.0.2.13', 80, CAM_USER, CAM_PASS),
-    },
-}
 
 STATE_FILE = Path(os.environ.get('DOCTOR_STATE_FILE', ROOT / 'logs' / 'camera_doctor_state.json'))
 LOG_FILE = ROOT / 'logs' / 'camera_doctor.log'
@@ -214,6 +193,32 @@ def cam_ip(cam: dict) -> str:
 
 def log(msg: str):
     print(f'{datetime.now():%Y-%m-%d %H:%M:%S} {msg}', flush=True)
+
+
+def _camera_table() -> dict:
+    """Cameras from .env. DOCTOR_CAMERAS lists the names; per camera (name upper-cased) _RTSP is its own
+    endpoint with credentials, _RESTREAM the go2rtc stream Frigate and VisionBox consume (default: the
+    name) and _ONVIF the SystemReboot target host[:port] (default: the RTSP host on port 80, same login)."""
+    cameras = {}
+    for name in (c.strip() for c in os.environ.get('DOCTOR_CAMERAS', '').split(',')):
+        if not name:
+            continue
+        key = f'DOCTOR_CAMERA_{name.upper()}'
+        rtsp = os.environ.get(f'{key}_RTSP', '')
+        if not rtsp:
+            log(f'[{name}] {key}_RTSP is not set in .env; camera skipped')
+            continue
+        parsed = urlparse(rtsp)
+        onvif_host, _, onvif_port = os.environ.get(f'{key}_ONVIF', parsed.hostname or '').partition(':')
+        cameras[name] = {
+            'rtsp': rtsp,
+            'restream': os.environ.get(f'{key}_RESTREAM', name),
+            'onvif': (onvif_host, int(onvif_port or 80), parsed.username or '', parsed.password or ''),
+        }
+    return cameras
+
+
+CAMERAS = _camera_table()
 
 
 def _push(base: str, topic: str, title: str, message: str, timeout: float = 10):
