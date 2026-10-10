@@ -84,8 +84,7 @@ class CameraStream:
     def _reader(self):
         # The cap is released HERE, in the same thread that reads it. Releasing a
         # VideoCapture from another thread while this one is inside cap.read() is a
-        # use-after-free in ffmpeg/OpenCV and segfaults the whole process — which is
-        # what happened on every flaky-WiFi reconnect.
+        # use-after-free in ffmpeg/OpenCV and segfaults the whole process.
         try:
             while not self.stopped:
                 ret, frame = self.cap.read()
@@ -719,7 +718,7 @@ def main():
         state.offline = True
         port = cfg.display.web_port
         start_api_server(state, port, cfg.display.bind_host)
-        print(f"VisionBox UI-only at http://0.0.0.0:{port}")
+        print(f"VisionBox UI-only at http://{cfg.display.bind_host}:{port}")
         if not args.no_browser:
             open_browser(f'http://localhost:{port}')
         stop = threading.Event()
@@ -750,7 +749,7 @@ def main():
     print("\nVisionBox running")
     print(f"  Cameras: {', '.join(p.name for p in pipelines)}")
     print(f"  Storage: {output_dir}")
-    print(f"  Web UI:  http://0.0.0.0:{port}")
+    print(f"  Web UI:  http://{cfg.display.bind_host}:{port}")
     print("  Press Ctrl+C to stop\n")
 
     for p in pipelines:
