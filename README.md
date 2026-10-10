@@ -188,11 +188,11 @@ Shared across cameras:
 ### systemd
 
 `visionbox.service` runs `scripts/surveillance.py` from the checkout with `.env` as its
-`EnvironmentFile`. It hardcodes `User=`, `Group=`, `WorkingDirectory=` and the venv path, so adjust
-those (and `RequiresMountsFor=` if your storage is not under `/mnt/storage`) before installing:
+`EnvironmentFile`. The unit is a template: the installer fills in your user, group and the
+checkout path (change `RequiresMountsFor=` yourself if your storage is not under `/mnt/storage`):
 
 ```bash
-./install-service.sh        # install + enable + start (refuses if the unit points elsewhere)
+./install-service.sh        # render the unit for this user and checkout, install, enable, start
 ./restart-service.sh        # restart and tail the journal, decoder noise filtered
 journalctl -u visionbox.service -f
 ```

@@ -1,3 +1,4 @@
+# Template: the installer substitutes the user, group and checkout path.
 [Unit]
 Description=VisionBox Multi-Camera Surveillance
 After=network-online.target

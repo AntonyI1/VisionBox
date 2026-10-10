@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 # Install the VisionBox overnight self-training timer.
 #   Run from the repo root:  sudo bash ./install-training-timer.sh
-# visionbox-train.service hardcodes User=, Group=, WorkingDirectory= and the script
-# path: edit it first if this checkout lives elsewhere or runs as another user.
+# visionbox-train.service is a template: this fills in the invoking user, group and checkout path.
 set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-UNIT_DIR=$(sed -n 's/^WorkingDirectory=//p' "$REPO/visionbox-train.service")
-if [ "$UNIT_DIR" != "$REPO" ]; then
-  echo "visionbox-train.service has WorkingDirectory=$UNIT_DIR but this checkout is $REPO; edit the units first." >&2
-  exit 1
-fi
+RUN_USER=${SUDO_USER:-$(id -un)}
+RUN_GROUP=$(id -gn "$RUN_USER")
 
 chmod +x "$REPO/scripts/training/run_overnight.sh"
-cp "$REPO/visionbox-train.service" /etc/systemd/system/visionbox-train.service
+sed -e "s#/opt/visionbox#$REPO#g" -e "s/^User=.*/User=$RUN_USER/" -e "s/^Group=.*/Group=$RUN_GROUP/" \
+  "$REPO/visionbox-train.service" > /etc/systemd/system/visionbox-train.service
 cp "$REPO/visionbox-train.timer"   /etc/systemd/system/visionbox-train.timer
 systemctl daemon-reload
 systemctl enable --now visionbox-train.timer

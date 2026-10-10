@@ -1,3 +1,4 @@
+# Template: the installer substitutes the user, group and checkout path.
 [Unit]
 Description=VisionBox nightly self-training (assemble -> train -> gate -> stage/promote)
 After=network-online.target visionbox.service
