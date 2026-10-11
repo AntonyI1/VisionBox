@@ -1,4 +1,4 @@
-const CACHE = 'visionbox-static-v3';
+const CACHE = 'visionbox-static-v4';
 const OFFLINE_PAGE = '/static/offline.html';
 const PRECACHE = [
     OFFLINE_PAGE,
@@ -10,9 +10,11 @@ const PRECACHE = [
 ];
 
 self.addEventListener('install', event => {
+    // /static/* is served with max-age=3600, so a plain addAll() could precache the
+    // browser's copy of the old app.js into the new cache; fetch past the HTTP cache.
     event.waitUntil(
         caches.open(CACHE)
-            .then(cache => cache.addAll(PRECACHE))
+            .then(cache => cache.addAll(PRECACHE.map(url => new Request(url, { cache: 'reload' }))))
             .then(() => self.skipWaiting())
     );
 });
