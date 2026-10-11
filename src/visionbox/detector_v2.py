@@ -25,7 +25,7 @@ class ModelConfig:
     path: str
     class_offset: int = 0
     class_names: dict[int, str] | None = None
-    conf_threshold: float = 0.25
+    conf_threshold: float | None = None   # None: use the threshold passed to detect()
     class_conf: dict[int, float] | None = None
 
 
@@ -46,7 +46,7 @@ class MultiModelDetector:
 
         self.models, self.class_names = self._build_models(model_configs)
 
-        self._warmup()
+        self.ov_device = self._warmup()
         print(f"Loaded {len(self.models)} model(s) on {self.effective_device}")
         print(f"Total classes: {len(self.class_names)}")
 
@@ -79,14 +79,16 @@ class MultiModelDetector:
 
         Loading and warming the new models happens outside swap_lock so live inference
         keeps going; only the final pointer swap runs under it. The OpenVINO device is
-        re-resolved so a model that fell back to CPU can return to the iGPU.
+        re-resolved so a model that fell back to CPU can return to the iGPU, but it is
+        published together with the new models: changing it early would make the live
+        model recompile for the new device under the lock, stalling every camera.
         """
-        self.ov_device = self._resolve_ov_device(self._device_arg)
+        ov_device = self._resolve_ov_device(self._device_arg)
         configs = [config for _, config, _ in self.models]
         new_models, new_class_names = self._build_models(configs)
-        self._warmup(new_models)
+        ov_device = self._warmup(new_models, ov_device)
         with swap_lock if swap_lock is not None else nullcontext():
-            self.models, self.class_names = new_models, new_class_names
+            self.models, self.class_names, self.ov_device = new_models, new_class_names, ov_device
         print(f"Reloaded {len(self.models)} model(s) on {self.effective_device}", flush=True)
         return {
             'models': len(self.models),
@@ -124,20 +126,26 @@ class MultiModelDetector:
             return self.ov_device
         return self.device
 
-    def _warmup(self, models=None):
-        """Prime each model (compiles GPU kernels) so the first real frame isn't slow."""
+    def _warmup(self, models=None, ov_device: str | None = None) -> str:
+        """Prime each model (compiles GPU kernels) so the first real frame isn't slow.
+
+        Returns the OpenVINO device the models ended up on: the requested one, or
+        intel:cpu when the iGPU refused to compile.
+        """
+        device = ov_device or self.ov_device
         blank = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
         for model, _, is_openvino in (models if models is not None else self.models):
             kw = {'imgsz': self.imgsz, 'verbose': False}
             if is_openvino:
-                kw['device'] = self.ov_device
+                kw['device'] = device
             try:
                 model(blank, **kw)
             except Exception as exc:
-                print(f"  [detector] warmup failed on {self.ov_device} "
+                print(f"  [detector] warmup failed on {device} "
                       f"({type(exc).__name__}); using CPU", flush=True)
-                if is_openvino and self.ov_device != 'intel:cpu':
-                    self.ov_device = 'intel:cpu'
+                if is_openvino and device != 'intel:cpu':
+                    device = 'intel:cpu'
+        return device
 
     @staticmethod
     def _find_best_model(path: str) -> str:
@@ -183,7 +191,7 @@ class MultiModelDetector:
         all_detections = []
 
         for model, config, is_openvino in self.models:
-            conf = config.conf_threshold or conf_threshold
+            conf = conf_threshold if config.conf_threshold is None else config.conf_threshold
             results = self._infer(model, frame, conf, iou_threshold, is_openvino)
 
             for result in results:
