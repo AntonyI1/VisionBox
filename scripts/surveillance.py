@@ -406,6 +406,11 @@ class CameraPipeline:
                         [*d['box'], d['confidence'], d['class_id']]
                         for d in detections
                     ]) if detections else np.empty((0, 6))
+            else:
+                # Detections describe the frame they were made on. Carrying the last list
+                # forward re-saved its boxes against every later frame as uncertain
+                # captures and kept the illumination guard's real-object veto on.
+                detections = []
 
             tracks = self.tracker.update(det_array if ran_detection else np.empty((0, 6)))
 
