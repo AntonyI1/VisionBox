@@ -19,7 +19,6 @@ cameras:
     url: rtsp://127.0.0.1:8554/backyard_gate           # 1920x1080 (no substream)
 
 storage:
-  recordings: ${STORAGE_DIR}/recordings
   crops:      ${STORAGE_DIR}/captures/crops
   dataset:    ${STORAGE_DIR}/captures/dataset
   review:     ${STORAGE_DIR}/datasets/review
@@ -98,7 +97,7 @@ tracker:
   positions_measured_only: true      # ignore Kalman-coasted positions when measuring movement
 
 recording:
-  output_dir: ${STORAGE_DIR}/recordings
+  output_dir: ${STORAGE_DIR}/recordings   # per-camera subdirectories are created under it
   clean:
     enabled: true
     max_duration: 130.0       # hard -t cap on the RTSP copy
@@ -122,7 +121,6 @@ capture:
   uncertain_interval: 5.0
 
 display:
-  web: true
   web_port: 8085
   max_fps: 15            # main-loop rate (motion + live view); detection is separately gated at detect_fps
   live_overlays: false   # clean live feeds; flip on to debug motion/track boxes (event clips keep annotations)

@@ -78,7 +78,6 @@ cameras:
     # test_input: samples/backyard.mp4                 # replace the stream with a file for offline testing
 
 storage:
-  recordings: ${STORAGE_DIR}/recordings   # per-camera subdir created automatically
   crops:      ${STORAGE_DIR}/captures/crops
   dataset:    ${STORAGE_DIR}/captures/dataset
   review:     ${STORAGE_DIR}/datasets/review
@@ -98,7 +97,7 @@ detection:
   confirm_threshold_by_class: { 0: 0.50 }
 
 recording:
-  output_dir: ${STORAGE_DIR}/recordings
+  output_dir: ${STORAGE_DIR}/recordings   # per-camera subdir created automatically
   clean:     { enabled: true, max_duration: 130.0, min_valid_bytes: 51200 }
   annotated: { enabled: true, fps: 15.0, cooldown: 10.0, max_duration: 120.0 }
   retention: { days: 30, max_storage_gb: 0, max_per_label: 0, priority_labels: [person] }

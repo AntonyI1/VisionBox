@@ -125,27 +125,7 @@ class CaptureConfig:
 
 
 @dataclass
-class TrainingConfig:
-    enabled: bool = False
-    dataset_dir: str = 'datasets/yolo'
-    replay_dir: str = 'datasets/coco_replay'
-    corrected_dir: str = 'datasets/corrected'
-    runs_dir: str = 'runs/train'
-    epochs: int = 50
-    freeze: int = 10
-    lr0: float = 0.001
-    imgsz: int = 640
-    batch: int = 16
-    device: str = 'cpu'          # training is CPU-only here (the iGPU can't train)
-    min_train_images: int = 50
-    regression_tolerance: float = 0.01  # new base-class mAP must be >= old - this
-    auto_promote: bool = False
-    schedule: str = '03:30'      # overnight HH:MM for the systemd timer / cron
-
-
-@dataclass
 class StorageConfig:
-    recordings: str = 'recordings'
     crops: str = 'captures/crops'
     dataset: str = 'captures/dataset'
     review: str = 'datasets/review'
@@ -155,7 +135,6 @@ class StorageConfig:
 
 @dataclass
 class DisplayConfig:
-    web: bool = True
     web_port: int = 8085
     bind_host: str = '0.0.0.0'   # set to the tailscale0 IP to keep the UI off the LAN
     max_fps: int = 15
@@ -171,7 +150,6 @@ class VisionBoxConfig:
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
-    training: TrainingConfig = field(default_factory=TrainingConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
 
     def camera_recordings_dir(self, name: str) -> Path:

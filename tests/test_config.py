@@ -54,7 +54,7 @@ def test_load_config_applies_overrides_and_keeps_defaults(tmp_path, monkeypatch,
             enabled: false
           bare:
         storage:
-          recordings: ${STORAGE_DIR}/recordings
+          crops: ${STORAGE_DIR}/captures/crops
         detection:
           device: gpu
           class_conf: {0: 0.5}
@@ -79,8 +79,8 @@ def test_load_config_applies_overrides_and_keeps_defaults(tmp_path, monkeypatch,
     assert cfg.cameras['bare'] == CameraConfig(name='bare')
     assert set(cfg.enabled_cameras()) == {'front_door', 'bare'}
 
-    assert cfg.storage.recordings == '/mnt/storage/recordings'
-    assert cfg.storage.crops == 'captures/crops'
+    assert cfg.storage.crops == '/mnt/storage/captures/crops'
+    assert cfg.storage.dataset == 'captures/dataset'
     assert cfg.detection.device == 'gpu'
     assert cfg.detection.class_conf == {0: 0.5}
     assert cfg.detection.imgsz == 640
