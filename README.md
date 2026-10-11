@@ -275,9 +275,8 @@ training scripts locate the repository from their own path and read `STORAGE_DIR
   DB, fully reversible.
 - Single-camera demos (need a display): `scripts/camera_demo.py [url] --mode outdoor` (detection +
   tracking), `scripts/motion_demo.py [url]` (press `m` to toggle motion gating),
-  `scripts/detect_and_capture.py [source] --no-display` (save crops + YOLO labels),
-  `scripts/capture_for_review.py` (high-confidence frames for review). They fall back to
-  `CAMERA_URL` from `.env` when no URL is given.
+  `scripts/detect_and_capture.py [source] --no-display` (save crops + YOLO labels). They fall back
+  to `CAMERA_URL` from `.env` when no URL is given.
 
 ## Development
 
@@ -311,7 +310,7 @@ scripts/
 ├── camera_doctor.py     # Cron watchdog: camera probes, ONVIF reboot, Frigate pipeline, ntfy
 ├── dedupe_crops.py      # Reversible crop de-duplication
 ├── quarantine_false_positives.py
-├── camera_demo.py / motion_demo.py / detect_and_capture.py / capture_for_review.py
+├── camera_demo.py / motion_demo.py / detect_and_capture.py
 └── training/            # assemble_dataset, prep_replay, train_overnight, promote_model,
                          # correct_labels, run_overnight.sh
 
