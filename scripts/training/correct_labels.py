@@ -12,6 +12,8 @@ Keys:
     q  quit (cursor persisted)
 
 --headless --min-conf X auto-accepts every frame whose prelabel confidences all exceed X.
+The queue only holds detections at or below capture.uncertain_high (0.6 by default), so a
+threshold at or above that ceiling accepts nothing.
 """
 
 import argparse
@@ -100,14 +102,21 @@ def _write_boxes(path, boxes):
 
 
 def _accept(camera, stem, boxes):
+    """Move the frame into the corrected tree with its reviewed labels.
+
+    The review copy and its prelabel go away: assemble_dataset.py reads both trees,
+    so leaving them behind trained every corrected frame twice, once with the
+    labels the correction had just overruled.
+    """
     out_img_dir = os.path.join(CORRECTED_ROOT, camera, "images")
     out_lbl_dir = os.path.join(CORRECTED_ROOT, camera, "labels")
     os.makedirs(out_img_dir, exist_ok=True)
     os.makedirs(out_lbl_dir, exist_ok=True)
     src_img = _img_path(camera, stem)
     ext = os.path.splitext(src_img)[1] or ".jpg"
-    shutil.copy2(src_img, os.path.join(out_img_dir, stem + ext))
+    shutil.move(src_img, os.path.join(out_img_dir, stem + ext))
     _write_boxes(os.path.join(out_lbl_dir, stem + ".txt"), boxes)
+    _delete(camera, stem)
 
 
 def _delete(camera, stem):
@@ -257,8 +266,9 @@ def main():
     parser.add_argument("--camera", help="Camera name under the review root.")
     parser.add_argument("--headless", action="store_true",
                         help="Auto-accept high-confidence frames without a GUI.")
-    parser.add_argument("--min-conf", type=float, default=0.6,
-                        help="Headless confidence threshold (all boxes must exceed it).")
+    parser.add_argument("--min-conf", type=float, default=0.5,
+                        help="Headless confidence threshold (all boxes must exceed it; the queue "
+                             "holds nothing above capture.uncertain_high, 0.6 by default).")
     args = parser.parse_args()
 
     assemble_dataset.require_storage_dir()
