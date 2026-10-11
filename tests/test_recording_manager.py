@@ -230,10 +230,11 @@ def test_delete_event_files_removes_media_and_sidecars(manager, tmp_path):
         (out / rel).write_bytes(b'x' * 10)
     (out / 'clean/event_x.json').write_bytes(b'y' * 5)
 
-    assert manager._delete_event_files({'event_id': 'x', **files}) == 45
+    assert manager._delete_event_files({'event_id': 'x', 'camera': 'front_door', **files}) == 45
     assert not any((out / rel).exists() for rel in files.values())
     assert not (out / 'clean/event_x.json').exists()
-    assert manager._delete_event_files({'event_id': 'x', 'clean_clip': 'clean/missing.mp4'}) == 0
+    missing = {'event_id': 'x', 'camera': 'front_door', 'clean_clip': 'clean/missing.mp4'}
+    assert manager._delete_event_files(missing) == 0
 
 
 def test_retention_thread_survives_a_failing_pass_and_vanished_files(tmp_path, db, fake_ffmpeg, monkeypatch, caplog):
@@ -262,6 +263,30 @@ def test_retention_thread_survives_a_failing_pass_and_vanished_files(tmp_path, d
     assert db.get_event('old') is None
     assert calls['n'] >= 2
     assert 'retention pass failed' in caplog.text
+
+
+def test_storage_budget_spans_all_cameras(tmp_path, db, fake_ffmpeg):
+    root = tmp_path / 'recordings'
+    budget_gb = 1536 / 1024 ** 3
+    managers = {}
+    for i, cam in enumerate(('front_door', 'backyard')):
+        managers[cam] = RecordingManager(_config(max_storage_gb=budget_gb), camera=cam, output_dir=root / cam, db=db)
+        start = datetime(2026, 1, 1, 12, i)
+        db.insert_event(f'e_{cam}', start, camera=cam, clean_clip=f'clean/event_e_{cam}.mp4')
+        db.update_event_end(f'e_{cam}', start + timedelta(seconds=5), 5.0, 1, 'car')
+        clip = root / cam / 'clean' / f'event_e_{cam}.mp4'
+        clip.parent.mkdir(parents=True, exist_ok=True)
+        clip.write_bytes(b'x' * 1000)
+
+    managers['backyard']._enforce_storage_limit()
+
+    # 2000 bytes against a 1536-byte budget: the oldest event goes, even though it
+    # belongs to the other camera, and the tree is then left alone.
+    assert not (root / 'front_door' / 'clean' / 'event_e_front_door.mp4').exists()
+    assert (root / 'backyard' / 'clean' / 'event_e_backyard.mp4').exists()
+    assert [e['event_id'] for e in db.get_events()] == ['e_backyard']
+    for mgr in managers.values():
+        mgr.stop()
 
 
 def test_per_label_cap_drops_oldest_events(tmp_path, db, fake_ffmpeg):

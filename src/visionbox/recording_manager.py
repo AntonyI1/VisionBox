@@ -18,6 +18,10 @@ from .recorder import EventRecorder, RecorderState
 
 logger = logging.getLogger(__name__)
 
+# The storage budget covers the whole recordings tree, so only one camera's
+# retention thread may measure and trim it at a time.
+_storage_budget_lock = threading.Lock()
+
 # Best-snapshot scoring (Frigate-style): prefer big, confident, non-edge boxes.
 EDGE_MARGIN_FRAC = 0.02   # a box side within 2% of a border counts as "touching"
 EDGE_PENALTY = 0.6        # multiplier per touched border (compounds)
@@ -313,14 +317,25 @@ class RecordingManager:
                 self._delete_event_files(ev)
                 self.db.delete_event(ev['event_id'])
 
+    def _storage_root(self) -> Path:
+        """The shared recordings tree: cameras record into sibling subdirectories of it."""
+        return self.output_dir.parent if self.camera else self.output_dir
+
+    def _event_dir(self, event: dict) -> Path:
+        camera = event.get('camera') or ''
+        if not self.camera or camera == self.camera:
+            return self.output_dir
+        return self._storage_root() / camera
+
     def _delete_event_files(self, event: dict) -> int:
         """Remove an event's clips, sidecar metadata, thumbnail and snapshot; returns bytes freed."""
         freed = 0
+        base = self._event_dir(event)
         for key in ('clean_clip', 'annotated_clip', 'thumbnail', 'snapshot'):
             rel = event.get(key, '')
             if not rel:
                 continue
-            path = Path(rel) if Path(rel).is_absolute() else self.output_dir / rel
+            path = Path(rel) if Path(rel).is_absolute() else base / rel
             targets = [path] if key in ('thumbnail', 'snapshot') else [path, path.with_suffix('.json')]
             for p in targets:
                 # The API's delete route and the per-label cap race this thread for the
@@ -350,11 +365,12 @@ class RecordingManager:
             self.db.delete_event(event['event_id'])
         self._enforce_storage_limit()
 
-    def _get_storage_bytes(self) -> int:
-        if not self.output_dir.exists():
+    @staticmethod
+    def _tree_bytes(root: Path) -> int:
+        if not root.exists():
             return 0
         total = 0
-        for f in self.output_dir.rglob('*'):
+        for f in root.rglob('*'):
             try:
                 if f.is_file():
                     total += f.stat().st_size
@@ -363,23 +379,24 @@ class RecordingManager:
         return total
 
     def _enforce_storage_limit(self):
+        """Trim the whole recordings tree to max_storage_gb, oldest non-priority events first.
+
+        Measured and trimmed across cameras: a per-camera budget would let four cameras
+        fill four times the configured limit while the dashboard reports one.
+        """
         max_gb = self.config.retention.max_storage_gb
         if max_gb <= 0:
             return
         max_bytes = int(max_gb * 1024 * 1024 * 1024)
-        current = self._get_storage_bytes()
-        if current <= max_bytes:
-            return
-        priority = self.config.retention.priority_labels
-        events = [
-            e for e in self.db.get_events_by_delete_priority(priority)
-            if (e.get('camera') or '') == self.camera
-        ]
-        for event in events:
+        with _storage_budget_lock:
+            current = self._tree_bytes(self._storage_root())
             if current <= max_bytes:
-                break
-            current -= self._delete_event_files(event)
-            self.db.delete_event(event['event_id'])
+                return
+            for event in self.db.get_events_by_delete_priority(self.config.retention.priority_labels):
+                if current <= max_bytes:
+                    break
+                current -= self._delete_event_files(event)
+                self.db.delete_event(event['event_id'])
 
     def abort(self):
         """Close the open event when the stream drops.
