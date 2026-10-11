@@ -1,11 +1,18 @@
 """YAML configuration with environment variable resolution."""
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
+
+
+class ConfigError(ValueError):
+    """config.yml cannot be applied as written."""
 
 
 @dataclass
@@ -188,7 +195,11 @@ class VisionBoxConfig:
 
 def _resolve_env_vars(value: str) -> str:
     def replacer(match):
-        return os.environ.get(match.group(1), '')
+        name = match.group(1)
+        if name not in os.environ:
+            # Blanking it would turn ${STORAGE_DIR}/recordings into /recordings.
+            raise ConfigError(f'${{{name}}} is used in the config but not set in the environment or .env')
+        return os.environ[name]
     return re.sub(r'\$\{(\w+)\}', replacer, value)
 
 
@@ -202,23 +213,34 @@ def _resolve_recursive(obj):
     return obj
 
 
-def _apply_dict(dc, data: dict):
-    """Apply a dict to a dataclass, recursing into nested dataclasses."""
+def _apply_dict(dc, data: dict, path: str = ''):
+    """Apply a dict to a dataclass, recursing into nested dataclasses.
+
+    Unknown keys are reported rather than dropped, so a typo does not silently
+    leave the default in force; a key or section left empty keeps its default.
+    """
     for key, value in data.items():
-        if not hasattr(dc, key):
+        label = f'{path}.{key}' if path else key
+        if key not in dc.__dataclass_fields__:
+            logger.warning('config: unknown key %s ignored', label)
+            continue
+        if value is None:
             continue
         current = getattr(dc, key)
-        if hasattr(current, '__dataclass_fields__') and isinstance(value, dict):
-            _apply_dict(current, value)
-        else:
-            setattr(dc, key, value)
+        if hasattr(current, '__dataclass_fields__'):
+            if isinstance(value, dict):
+                _apply_dict(current, value, label)
+            else:
+                logger.warning('config: %s must be a mapping; ignored', label)
+            continue
+        setattr(dc, key, value)
 
 
 def _build_cameras(raw_cameras: dict) -> dict[str, CameraConfig]:
     cameras = {}
     for name, body in (raw_cameras or {}).items():
         cam = CameraConfig(name=name)
-        _apply_dict(cam, body or {})
+        _apply_dict(cam, body or {}, f'cameras.{name}')
         cam.name = name  # body cannot override the dict key
         cameras[name] = cam
     return cameras

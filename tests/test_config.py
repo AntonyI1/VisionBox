@@ -1,14 +1,36 @@
 import textwrap
 
-from visionbox.config import CameraConfig, VisionBoxConfig, _resolve_env_vars, load_config
+import pytest
+
+from visionbox.config import CameraConfig, ConfigError, MotionConfig, VisionBoxConfig, _resolve_env_vars, load_config
 
 
-def test_resolve_env_vars_substitutes_known_and_blanks_unknown(monkeypatch):
+def test_resolve_env_vars_substitutes_known_and_rejects_unknown(monkeypatch):
     monkeypatch.setenv('STORAGE_DIR', '/mnt/storage')
     monkeypatch.delenv('MISSING_VAR', raising=False)
     assert _resolve_env_vars('${STORAGE_DIR}/recordings') == '/mnt/storage/recordings'
-    assert _resolve_env_vars('${MISSING_VAR}/x') == '/x'
     assert _resolve_env_vars('plain') == 'plain'
+    with pytest.raises(ConfigError, match='MISSING_VAR'):
+        _resolve_env_vars('${MISSING_VAR}/x')
+
+
+def test_emptied_sections_and_misspelled_keys_keep_defaults(tmp_path, caplog):
+    cfg_file = tmp_path / 'config.yml'
+    cfg_file.write_text(textwrap.dedent('''
+        motion:
+        detection:
+          model:
+          confidnce: 0.5
+        tracker: 7
+    '''))
+
+    cfg = load_config(cfg_file)
+
+    assert cfg.motion == MotionConfig()
+    assert cfg.detection.model == 'yolov8n.pt'
+    assert cfg.detection.confidence == 0.3
+    assert 'detection.confidnce' in caplog.text
+    assert 'tracker must be a mapping' in caplog.text
 
 
 def test_missing_or_empty_file_gives_defaults(tmp_path):
@@ -18,7 +40,7 @@ def test_missing_or_empty_file_gives_defaults(tmp_path):
     assert load_config(empty) == VisionBoxConfig()
 
 
-def test_load_config_applies_overrides_and_keeps_defaults(tmp_path, monkeypatch):
+def test_load_config_applies_overrides_and_keeps_defaults(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv('STORAGE_DIR', '/mnt/storage')
     cfg_file = tmp_path / 'config.yml'
     cfg_file.write_text(textwrap.dedent('''
@@ -69,6 +91,8 @@ def test_load_config_applies_overrides_and_keeps_defaults(tmp_path, monkeypatch)
     assert cfg.recording.retention.priority_labels == ['person', 'dog']
     assert cfg.recording.retention.days == 14
     assert not hasattr(cfg, 'unknown_section')
+    assert 'unknown key unknown_section' in caplog.text
+    assert 'cameras.front_door.name' not in caplog.text  # a known field, just not overridable
 
 
 def test_per_camera_path_helpers():
