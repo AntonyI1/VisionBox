@@ -112,6 +112,40 @@ def test_trigger_subset_drives_counts_and_count_now_gates_tallying(manager, db):
     assert row['detection_count'] == 1
 
 
+def test_without_annotated_recorder_events_follow_cooldown_and_max_duration(tmp_path, db):
+    cfg = _config()
+    cfg.annotated.enabled = False
+    cfg.annotated.cooldown = 5.0
+    cfg.annotated.max_duration = 60.0
+    mgr = RecordingManager(cfg, camera='front_door', output_dir=tmp_path / 'front_door', db=db)
+    clock = {'t': 1000.0}
+    mgr._clock = lambda: clock['t']
+
+    mgr.update(FRAME, None, triggered=True, detections=[_person()])
+    first = mgr.event_id
+    assert mgr.is_recording and mgr.state == RecorderState.RECORDING
+    clock['t'] += 1
+    mgr.update(FRAME, None, triggered=False)
+    assert mgr.is_recording and mgr.event_id == first and mgr.state == RecorderState.COOLDOWN
+    clock['t'] += 3
+    mgr.update(FRAME, None, triggered=True)
+    assert mgr.state == RecorderState.RECORDING
+    clock['t'] += 5
+    mgr.update(FRAME, None, triggered=False)
+    assert not mgr.is_recording and mgr.state == RecorderState.IDLE
+    row = db.get_event(first)
+    assert row['end_time'] is not None and row['annotated_clip'] == ''
+
+    mgr.update(FRAME, None, triggered=True)
+    second = mgr.event_id
+    assert second != first  # started within the same second as the first: ids stay unique
+    clock['t'] += 61
+    mgr.update(FRAME, None, triggered=True)
+    assert not mgr.is_recording  # max_duration backstop
+    assert db.get_event_count() == 2
+    mgr.stop()
+
+
 def test_frame_score_prefers_large_confident_centered_boxes():
     score = RecordingManager._frame_score
     assert score([], 100, 100) == 0.0

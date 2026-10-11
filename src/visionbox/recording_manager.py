@@ -89,6 +89,11 @@ class RecordingManager:
         self._retention_thread: threading.Thread | None = None
         self._current_event_id: str | None = None
         self._event_start: datetime | None = None
+        # Event timing when there is no annotated recorder to follow.
+        self._clock = time.monotonic
+        self._event_start_mono = 0.0
+        self._last_trigger_mono = 0.0
+        self._timer_state = RecorderState.IDLE
 
     def start(self):
         (self.output_dir / 'thumbnails').mkdir(parents=True, exist_ok=True)
@@ -136,11 +141,12 @@ class RecordingManager:
                 annotated_frame if annotated_frame is not None else frame,
                 triggered, detections,
             )
+            recording = self.annotated.is_recording
+        else:
+            recording = self._time_event(triggered)
 
-        if not was_recording:
-            started = self.annotated.is_recording if self.annotated else triggered
-            if started:
-                self._start_event()
+        if recording and not was_recording:
+            self._start_event()
 
         # Score the snapshot and tally labels from the trigger subset (confirmed, moving objects)
         # when given, so parked cars do not dominate top_label / detection_count / snapshot.
@@ -157,8 +163,32 @@ class RecordingManager:
                 for d in score_dets:
                     self._detection_counts[d.get('class_name', 'unknown')] += 1
 
-        if was_recording and (self.annotated is None or self.annotated.state == RecorderState.IDLE):
+        if was_recording and not recording:
             self._end_event()
+
+    def _time_event(self, triggered: bool) -> bool:
+        """Same IDLE -> RECORDING -> COOLDOWN cycle as EventRecorder, without a clip to write."""
+        now = self._clock()
+        timing = self.config.annotated
+        if self._current_event_id is None:
+            if not triggered:
+                self._timer_state = RecorderState.IDLE
+                return False
+            self._event_start_mono = self._last_trigger_mono = now
+            self._timer_state = RecorderState.RECORDING
+            return True
+        if timing.max_duration > 0 and now - self._event_start_mono >= timing.max_duration:
+            self._timer_state = RecorderState.IDLE
+            return False
+        if triggered:
+            self._last_trigger_mono = now
+            self._timer_state = RecorderState.RECORDING
+            return True
+        if now - self._last_trigger_mono < timing.cooldown:
+            self._timer_state = RecorderState.COOLDOWN
+            return True
+        self._timer_state = RecorderState.IDLE
+        return False
 
     @property
     def is_recording(self) -> bool:
@@ -168,7 +198,7 @@ class RecordingManager:
     def state(self) -> RecorderState:
         if self.annotated:
             return self.annotated.state
-        return RecorderState.IDLE
+        return self._timer_state
 
     @property
     def event_id(self) -> str | None:
@@ -190,7 +220,11 @@ class RecordingManager:
     def _start_event(self):
         self._reset_event_state()
         now = datetime.now()
-        event_id = self._event_key(now)
+        event_id = base_id = self._event_key(now)
+        n = 1
+        while self.db.get_event(event_id) is not None:   # two events within one second
+            n += 1
+            event_id = f'{base_id}_{n}'
         self._current_event_id = event_id
         self._event_start = now
 
