@@ -103,7 +103,7 @@ recording:
     max_duration: 130.0       # hard -t cap on the RTSP copy
     min_valid_bytes: 51200    # remove broken (<50KB) clean clips; keep the annotated clip + event row
   annotated:
-    enabled: true
+    enabled: true             # cooldown and max_duration still time the event when this is false
     fps: 15.0
     cooldown: 10.0
     max_duration: 120.0       # force-end runaway events (observed real max ~46s)

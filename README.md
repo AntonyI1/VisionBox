@@ -47,7 +47,8 @@ pip install -r requirements.txt
 
 python scripts/setup_models.py     # fetches yolov8n.pt (+ an optional license-plate model used by the demos)
 PYTHONPATH=src python -c "from visionbox import export_openvino; export_openvino()"
-mv yolov8n_openvino_model models/  # the detector looks next to the .pt first, then in models/
+mv yolov8n_openvino_model models/yolov8n_base_openvino_model
+ln -s yolov8n_base_openvino_model models/yolov8n_openvino_model   # the active model is this symlink
 
 cp .env.sample .env && chmod 600 .env
 # set STORAGE_DIR, the dashboard login, and any camera credentials referenced from config.yml
@@ -108,13 +109,19 @@ display:
 ```
 
 The shipped `config.yml` also tunes motion (`min_area`, the illumination guard, motion-overlap
-trigger) and the tracker (ages, IoU, stationary-object filter); every key maps to a field in
-`src/visionbox/config.py`.
+trigger) and the tracker (ages, IoU, stationary-object filter). Motion additionally accepts the
+MOG2 parameters `var_threshold`, `history`, `detect_shadows`, `learning_rate` and a `min_area_frac`
+floor, and `recording.clean.stop_grace` is how long ffmpeg may flush before it is killed. Every key
+maps to a field in `src/visionbox/config.py`; a key that maps to nothing is reported at start-up,
+and a `${VAR}` that is not set refuses to start. With `annotated.enabled: false` the `cooldown` and
+`max_duration` still time the event itself.
 
 Per-camera assets land at:
 - `recordings/<camera>/{clean,annotated,thumbnails,snapshots}/`
-- `captures/crops/<camera>/<class>/`
+- `captures/crops/<camera>/<class>/` (the crops the dashboard's Review tab approves or rejects)
 - `captures/dataset/<camera>/{images,labels}/`
+- `datasets/review/<camera>/` (frames with mid-confidence detections, prelabel + sidecar: the queue
+  `correct_labels.py` works through)
 - `zones/<camera>.json`
 
 The SQLite event DB is shared at `recordings/visionbox.db`. Each `events` row carries the camera,
@@ -180,7 +187,8 @@ Shared across cameras:
   warms a new model off-lock and swaps it in, so a promoted model goes live without a restart.
 - One `RecordingDatabase` at `<recordings>/visionbox.db`.
 - One Flask API server; an RSS watchdog that exits for a clean systemd restart if memory stays
-  above `VISIONBOX_MAX_RSS_MB` (default 4096). Retention runs per camera, on its `RecordingManager`.
+  above `VISIONBOX_MAX_RSS_MB` (default 4096). Age-based retention runs per camera on its
+  `RecordingManager`; the storage budget is measured and trimmed across the whole recordings tree.
 
 ## Hosting
 
@@ -221,8 +229,9 @@ journalctl -u visionbox.service -f
 Alerts need `NTFY_TOPIC` (and optionally `NTFY_URL`) in `.env`; a push that fails there is retried on
 `NTFY_FALLBACK_URL`/`NTFY_FALLBACK_TOPIC` (a public ntfy.sh topic works: pushes carry no secrets), and
 an alert that could not be delivered is retried on the next run. `DOCTOR_PUBLIC_URL` is the proxied
-URL to probe and `DOCTOR_FRIGATE_LAN_URL` the LAN address quoted in tailnet pushes; `FRIGATE_*` and
-`DOCTOR_*` tunables are listed in the module docstring and in `.env.sample`. `--dry-run` prints the
+URL to probe and `DOCTOR_FRIGATE_LAN_URL` the LAN address quoted in tailnet pushes; the `FRIGATE_*`
+and `DOCTOR_*` tunables are listed with their defaults in `.env.sample` and explained in the module
+docstring. `--dry-run` prints the
 decisions without rebooting, restarting or notifying; `--verbose` prints every probe. The cameras it
 probes are defined in `.env`: `DOCTOR_CAMERAS` lists them and `DOCTOR_CAMERA_<NAME>_RTSP`,
 `_RESTREAM` and `_ONVIF` describe each one.
@@ -246,10 +255,10 @@ touching live surveillance (`Nice=15`, idle IO):
 | Script | Role |
 | --- | --- |
 | `prep_replay.py` | Freeze a small COCO replay set (`--limit`, `--force`) for the regression gate; needs internet once. |
-| `assemble_dataset.py` | Gather captured, reviewed and corrected labels into a YOLO dataset with a frozen val split (`--dry-run`). |
+| `assemble_dataset.py` | Gather the capture frames, the mid-confidence queue (`datasets/review`) and the corrected labels into a YOLO dataset with a frozen val split (`--dry-run`); `datasets/yolo/classes_custom.yaml` adds class names beyond COCO. |
 | `train_overnight.py` | Fine-tune yolov8n with the backbone frozen, compare base-class mAP against the active model on the replay set, export to OpenVINO, then stage the candidate (or promote with `--auto-promote`). A missing replay set fails closed. |
 | `promote_model.py` | Copy an export into a durable slot under `models/`, repoint the active symlink and `SIGHUP` the service; `--rollback` restores the previous model. |
-| `correct_labels.py` | Assisted labelling of the review queue (OpenCV window; `--headless --min-conf` auto-accepts confident frames). |
+| `correct_labels.py` | Assisted labelling of the mid-confidence queue (OpenCV window; `--headless --min-conf` auto-accepts frames whose boxes all clear the threshold). Accepted frames move to `datasets/corrected`. |
 | `run_overnight.sh` | Entrypoint used by the timer: refresh the replay set, then train. |
 
 ```bash
@@ -259,10 +268,14 @@ venv/bin/python3 scripts/training/promote_model.py            # promote the stag
 venv/bin/python3 scripts/training/promote_model.py --rollback
 ```
 
-Each run writes `runs/train/<run>/REPORT.json`. Uncomment `Environment=AUTO_PROMOTE=1` in the
-service unit to hot-swap automatically whenever the gate passes. The active model is the
-`models/yolov8n_openvino_model` symlink; `models/.prev_active` records the rollback target. The
-training scripts locate the repository from their own path and read `STORAGE_DIR` from `.env`.
+Each run writes `runs/train/<run>/REPORT.json`; a run whose gate fails or aborts exits non-zero so
+the unit shows it. Uncomment `Environment=AUTO_PROMOTE=1` in the installed unit
+(`/etc/systemd/system/visionbox-train.service`, then `systemctl daemon-reload`) to hot-swap
+automatically whenever the gate passes; editing the template in the checkout changes nothing until
+it is reinstalled. The active model is the `models/yolov8n_openvino_model` symlink (a plain export
+directory left there by the Quick Start is turned into the base slot on the first promotion);
+`models/.prev_active` records the rollback target. The training scripts locate the repository from
+their own path and read `STORAGE_DIR` from `.env`.
 
 ## Tools
 
@@ -273,10 +286,11 @@ training scripts locate the repository from their own path and read `STORAGE_DIR
   move the files of recognisable false-positive events (parked-car re-detections, night IR
   phantoms, orphaned rows) into `_quarantine/` and flag the rows; dry-run by default, backs up the
   DB, fully reversible.
-- Single-camera demos (need a display): `scripts/camera_demo.py [url] --mode outdoor` (detection +
-  tracking), `scripts/motion_demo.py [url]` (press `m` to toggle motion gating),
+- Single-camera demos: `scripts/camera_demo.py [url] --mode outdoor` (detection + tracking),
+  `scripts/motion_demo.py [url]` (press `m` to toggle motion gating),
   `scripts/detect_and_capture.py [source] --no-display` (save crops + YOLO labels). They fall back
-  to `CAMERA_URL` from `.env` when no URL is given.
+  to `CAMERA_URL` from `.env` when no URL is given. Their windows need `opencv-python` in place of
+  the `opencv-python-headless` wheel that `requirements.txt` installs for the server.
 
 ## Development
 
