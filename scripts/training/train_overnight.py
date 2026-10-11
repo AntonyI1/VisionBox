@@ -162,10 +162,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
-    run(args.run_ts, max(1, min(args.epochs, MAX_EPOCHS)), args.auto_promote)
+    report = run(args.run_ts, max(1, min(args.epochs, MAX_EPOCHS)), args.auto_promote)
+    # A failed gate or an aborted run must show up as a failed unit, not a green oneshot.
+    return 0 if report["gate"] == "PASS" else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
