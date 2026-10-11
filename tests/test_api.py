@@ -241,6 +241,31 @@ def test_event_media_resolves_relative_to_camera_dir(client, state):
     assert client.get('/api/events/nope').status_code == 404
 
 
+def test_clip_honours_range_requests(client, state):
+    cam_dir = state.output_dir / 'front'
+    cam_dir.mkdir(parents=True)
+    (cam_dir / 'e1.mp4').write_bytes(bytes(range(256)) * 4)
+    state.db = FakeDB({'e1': {'event_id': 'e1', 'camera': 'front', 'clean_clip': 'e1.mp4', 'annotated_clip': None}})
+    url = '/api/events/e1/clip/clean'
+
+    full = client.get(url)
+    assert full.status_code == 200
+    assert len(full.data) == 1024
+
+    part = client.get(url, headers={'Range': 'bytes=100-99999'})  # end past EOF is clamped
+    assert part.status_code == 206
+    assert part.headers['Accept-Ranges'] == 'bytes'
+    assert part.headers['Content-Range'] == 'bytes 100-1023/1024'
+    assert part.data == (bytes(range(256)) * 4)[100:]
+
+    tail = client.get(url, headers={'Range': 'bytes=-100'})
+    assert tail.status_code == 206
+    assert tail.headers['Content-Range'] == 'bytes 924-1023/1024'
+
+    for unsatisfiable in ('bytes=2000-', 'bytes=500-100', 'bytes=abc-'):
+        assert client.get(url, headers={'Range': unsatisfiable}).status_code == 416, unsatisfiable
+
+
 def test_delete_event_removes_files_and_sidecars(client, state):
     cam_dir = state.output_dir / 'front'
     cam_dir.mkdir(parents=True)

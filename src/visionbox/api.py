@@ -387,13 +387,10 @@ def create_app(state: CamerasState) -> Flask:
             abort(400)
         event = state.db.get_event(event_id)
         clip_path = _event_path(state, event, f'{clip_type}_clip') if event else None
-        if clip_path is None:
+        if clip_path is None or not clip_path.exists():
             abort(404)
-        h264_path = clip_path.with_name(clip_path.stem + '.h264.mp4')
-        serve_path = h264_path if h264_path.exists() else clip_path
-        if not serve_path.exists():
-            abort(404)
-        return _send_video(str(serve_path))
+        # conditional=True gives HTML5 video its Range requests (206/416) via Werkzeug.
+        return send_file(str(clip_path), mimetype='video/mp4', conditional=True)
 
     # ----- Model / self-training -----
 
@@ -738,38 +735,6 @@ def _human_size(nbytes: int) -> str:
             return f'{nbytes:.1f} {unit}'
         nbytes /= 1024
     return f'{nbytes:.1f} PB'
-
-
-def _send_video(path: str) -> Response:
-    """Serve MP4 with Range header support for HTML5 video seeking."""
-    file_size = os.path.getsize(path)
-    range_header = request.headers.get('Range')
-    if range_header:
-        match = range_header.replace('bytes=', '').split('-')
-        byte_start = int(match[0])
-        byte_end = int(match[1]) if match[1] else file_size - 1
-        content_length = byte_end - byte_start + 1
-
-        def generate():
-            with open(path, 'rb') as f:
-                f.seek(byte_start)
-                remaining = content_length
-                while remaining > 0:
-                    chunk = f.read(min(262144, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    yield chunk
-
-        return Response(
-            generate(), status=206, mimetype='video/mp4',
-            headers={
-                'Content-Range': f'bytes {byte_start}-{byte_end}/{file_size}',
-                'Accept-Ranges': 'bytes',
-                'Content-Length': content_length,
-            },
-        )
-    return send_file(path, mimetype='video/mp4')
 
 
 def _next_jpeg(view: CameraView, last_sent: int) -> tuple[bytes | None, int]:
