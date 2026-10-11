@@ -71,6 +71,23 @@ def _atomic_symlink(target, link_path):
     os.replace(tmp, link_path)
 
 
+def _ensure_link(link_path):
+    """Turn a real export directory at the active path into the base slot plus a link.
+
+    The Quick Start leaves the first OpenVINO export as a plain directory here;
+    os.replace() cannot swap a symlink over a directory, so keep that export as
+    yolov8n_base_openvino_model and point the link at it before promoting.
+    """
+    if os.path.islink(link_path) or not os.path.isdir(link_path):
+        return
+    base = os.path.join(os.path.dirname(link_path), "yolov8n_base_openvino_model")
+    if os.path.exists(base):
+        base = f"{link_path}.base.{os.getpid()}"
+    os.rename(link_path, base)
+    os.symlink(os.path.abspath(base), link_path)
+    print(f"kept the export at {link_path} as {base}; {link_path} is now a symlink")
+
+
 def _record_prev_active():
     """Persist the current active target to .prev_active for rollback."""
     if os.path.islink(ACTIVE_LINK):
@@ -102,6 +119,7 @@ def _reload():
 def promote(run_dir=None):
     """Promote the exported model under run_dir to the active slot (durable copy)."""
     export_dir = find_export(run_dir)
+    _ensure_link(ACTIVE_LINK)
     durable = _materialize(export_dir, run_dir)
     prev = _record_prev_active()
     if prev and os.path.realpath(durable) == os.path.realpath(prev):
@@ -123,6 +141,7 @@ def rollback():
         raise ValueError(f"{PREV_ACTIVE} is empty; nothing to roll back to")
     if not os.path.exists(prev):
         raise FileNotFoundError(f"previous model {prev} no longer exists")
+    _ensure_link(ACTIVE_LINK)
     _atomic_symlink(prev, ACTIVE_LINK)
     method = _reload()
     print(f"rolled back to {prev} (reload via {method})")

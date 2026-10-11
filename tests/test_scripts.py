@@ -229,6 +229,22 @@ class PromoteModel(unittest.TestCase):
         self.assertEqual(os.path.realpath(promote.ACTIVE_LINK), durable)
         self.assertEqual(self.reloads, ['sighup'])
 
+    def test_promote_keeps_a_quick_start_export_directory_as_the_base_slot(self):
+        # Quick Start leaves the first export as a real directory at the active path.
+        first_export = Path(promote.ACTIVE_LINK)
+        first_export.mkdir()
+        (first_export / 'metadata.yaml').write_text('names: {base}\n')
+
+        durable = promote.promote(str(self._export('overnight_5').parents[1]))
+
+        base = self.models / 'yolov8n_base_openvino_model'
+        self.assertTrue(os.path.islink(promote.ACTIVE_LINK))
+        self.assertEqual(os.path.realpath(promote.ACTIVE_LINK), durable)
+        self.assertEqual((base / 'metadata.yaml').read_text(), 'names: {base}\n')
+        self.assertEqual(Path(promote.PREV_ACTIVE).read_text().strip(), str(base))
+        self.assertEqual(promote.rollback(), str(base))
+        self.assertEqual(os.path.realpath(promote.ACTIVE_LINK), str(base))
+
     def test_rollback_restores_previous_target(self):
         base = self._activate_base()
         promote.promote(str(self._export('overnight_3').parents[1]))
