@@ -252,16 +252,12 @@ class RecordingManager:
         duration = (now - self._event_start).total_seconds() if self._event_start else 0
 
         clean_path = None
-        if self.clean:
-            if self.clean.is_recording:
-                clean_path = self.clean.stop_event()
-                if clean_path is None:
-                    # broken/empty clean clip was discarded — clear the dangling DB pointer
-                    self.db.update_event_clean_clip(self._current_event_id, '')
-            else:
-                # ffmpeg already exited (-t cap); the clip may still exist on disk
-                p = self.output_dir / 'clean' / f'event_{self._current_event_id}.mp4'
-                clean_path = str(p) if p.exists() else None
+        if self.clean and self.clean.event_id == self._current_event_id:
+            # Finalise whether ffmpeg is still running, hit its -t cap or died early:
+            # the size floor, the sidecar and the DB pointer are decided in one place.
+            clean_path = self.clean.stop_event()
+            if clean_path is None:
+                self.db.update_event_clean_clip(self._current_event_id, '')
 
         top_label = ''
         total_detections = sum(self._detection_counts.values())

@@ -1,8 +1,10 @@
 import io
 import json
+import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -24,6 +26,30 @@ class FakeFFmpeg:
 
     def wait(self, timeout=None):
         return 0
+
+    def kill(self):
+        pass
+
+
+class FakeDeadFFmpeg:
+    """A clean-copy ffmpeg that fails at once, leaving a header-sized stub behind."""
+
+    returncode = 1
+
+    def __init__(self, cmd, **kwargs):
+        out = Path(cmd[-1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b'\x00' * 10)
+        kwargs['stderr'].write(b'Connection refused\n')
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def send_signal(self, sig):
+        pass
 
     def kill(self):
         pass
@@ -110,6 +136,26 @@ def test_trigger_subset_drives_counts_and_count_now_gates_tallying(manager, db):
     row = db.get_event(event_id)
     assert row['top_label'] == 'person'
     assert row['detection_count'] == 1
+
+
+def test_clean_clip_that_ffmpeg_abandoned_is_dropped_from_the_row(tmp_path, db, monkeypatch, caplog):
+    monkeypatch.setattr(subprocess, 'Popen', FakeDeadFFmpeg)
+    monkeypatch.setattr(shutil, 'which', lambda name: '/usr/bin/ffmpeg')
+    cfg = _config()
+    cfg.clean.enabled = True
+    cfg.annotated.enabled = False
+    out = tmp_path / 'front_door'
+    mgr = RecordingManager(cfg, rtsp_url='rtsp://cam/stream', camera='front_door', output_dir=out, db=db)
+
+    mgr.update(FRAME, None, triggered=True, detections=[_person()])
+    event_id = mgr.event_id
+    assert db.get_event(event_id)['clean_clip'] == f'clean/event_{event_id}.mp4'
+    mgr.update(FRAME, None, triggered=False)
+
+    assert db.get_event(event_id)['clean_clip'] == ''
+    assert list((out / 'clean').iterdir()) == []  # stub clip and ffmpeg log both removed
+    assert 'Connection refused' in caplog.text
+    mgr.stop()
 
 
 def test_abort_closes_the_event_and_the_annotated_recorder(manager, db):
