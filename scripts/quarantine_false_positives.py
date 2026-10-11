@@ -125,7 +125,10 @@ def quarantine(db_path: str, apply: bool):
                         candidates.append(candidates[0].with_suffix('.json'))
                     for src in candidates:
                         if src.exists():
-                            dst = qdir / src.relative_to(out)
+                            try:
+                                dst = qdir / src.relative_to(out)
+                            except ValueError:  # legacy absolute path outside the camera dir
+                                dst = qdir / src.name
                             dst.parent.mkdir(parents=True, exist_ok=True)
                             shutil.move(str(src), str(dst))
                             moved.append({'src': str(src), 'dst': str(dst)})
