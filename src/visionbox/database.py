@@ -78,6 +78,15 @@ class RecordingDatabase:
             (end_time.isoformat(), duration, detection_count, top_label, event_id),
         )
 
+    def get_open_events(self, camera: str | None = None) -> list[dict]:
+        """Rows without an end time: an event in progress, or one a crash left behind."""
+        query = 'SELECT * FROM events WHERE end_time IS NULL'
+        params: list = []
+        if camera:
+            query += ' AND camera=?'
+            params.append(camera)
+        return self._select(query, params)
+
     def get_events_before(self, before: datetime) -> list[dict]:
         return self._select(
             'SELECT * FROM events WHERE end_time IS NOT NULL AND end_time < ?',
@@ -163,6 +172,9 @@ class RecordingDatabase:
 
     def update_event_clean_clip(self, event_id: str, clean_clip: str):
         self._execute('UPDATE events SET clean_clip=? WHERE event_id=?', (clean_clip, event_id))
+
+    def update_event_annotated_clip(self, event_id: str, annotated_clip: str):
+        self._execute('UPDATE events SET annotated_clip=? WHERE event_id=?', (annotated_clip, event_id))
 
     def close(self):
         with self._lock:

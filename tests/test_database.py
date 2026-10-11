@@ -69,6 +69,15 @@ def test_delete_event(db):
     assert db.get_event_count() == 0
 
 
+def test_open_events_are_listed_per_camera(db):
+    _add(db, 'done')
+    _add(db, 'open_fd', end_after=None)
+    _add(db, 'open_by', camera='backyard', end_after=None)
+
+    assert [e['event_id'] for e in db.get_open_events()] == ['open_fd', 'open_by']
+    assert [e['event_id'] for e in db.get_open_events(camera='backyard')] == ['open_by']
+
+
 def test_events_before_cutoff_only_returns_finished_events(db):
     _add(db, 'old', start=T0 - timedelta(days=30))
     _add(db, 'new', start=T0)
@@ -105,10 +114,12 @@ def test_update_media_paths(db):
     db.update_event_thumbnail('e1', 'thumbnails/event_e1.jpg')
     db.update_event_snapshot('e1', 'snapshots/event_e1.jpg')
     db.update_event_clean_clip('e1', '')
+    db.update_event_annotated_clip('e1', 'annotated/event_e1.mp4')
     event = db.get_event('e1')
     assert event['thumbnail'] == 'thumbnails/event_e1.jpg'
     assert event['snapshot'] == 'snapshots/event_e1.jpg'
     assert event['clean_clip'] == ''
+    assert event['annotated_clip'] == 'annotated/event_e1.mp4'
 
 
 def test_migration_adds_missing_columns_to_a_legacy_table(tmp_path):

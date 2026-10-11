@@ -102,6 +102,7 @@ class RecordingManager:
     def start(self):
         (self.output_dir / 'thumbnails').mkdir(parents=True, exist_ok=True)
         (self.output_dir / 'snapshots').mkdir(parents=True, exist_ok=True)
+        self._recover_open_events()
         if self.config.retention.days > 0:
             self._retention_thread = threading.Thread(
                 target=self._retention_loop, daemon=True,
@@ -317,6 +318,38 @@ class RecordingManager:
                 self._delete_event_files(ev)
                 self.db.delete_event(ev['event_id'])
 
+    def _recover_open_events(self):
+        """Settle rows a crash left without an end time: keep a usable clean clip, drop the rest.
+
+        Retention only ever looks at finished events, so without this an OOM kill or a
+        watchdog restart leaves the row and its clips on disk for good.
+        """
+        for event in self.db.get_open_events(camera=self.camera):
+            event_id = event['event_id']
+            clip = self._media_path(event, 'clean_clip')
+            usable = clip is not None and clip.exists() and clip.stat().st_size >= self.config.clean.min_valid_bytes
+            if not usable:
+                self._delete_event_files(event)
+                self.db.delete_event(event_id)
+                logger.info('[%s] dropped unfinished event %s: no usable clip', self.camera or 'default', event_id)
+                continue
+            ended = datetime.fromtimestamp(clip.stat().st_mtime)
+            started = datetime.fromisoformat(event['start_time'])
+            duration = round(max(0.0, (ended - started).total_seconds()), 1)
+            self.db.update_event_end(event_id, ended, duration)
+            annotated = self._media_path(event, 'annotated_clip')
+            if annotated is not None and not annotated.exists():
+                self.db.update_event_annotated_clip(event_id, '')
+            logger.info('[%s] recovered event %s left open by a restart (%.1fs)',
+                        self.camera or 'default', event_id, duration)
+
+    def _media_path(self, event: dict, key: str) -> Path | None:
+        rel = event.get(key) or ''
+        if not rel:
+            return None
+        path = Path(rel)
+        return path if path.is_absolute() else self._event_dir(event) / path
+
     def _storage_root(self) -> Path:
         """The shared recordings tree: cameras record into sibling subdirectories of it."""
         return self.output_dir.parent if self.camera else self.output_dir
@@ -335,9 +368,12 @@ class RecordingManager:
             rel = event.get(key, '')
             if not rel:
                 continue
-            path = Path(rel) if Path(rel).is_absolute() else base / rel
-            targets = [path] if key in ('thumbnail', 'snapshot') else [path, path.with_suffix('.json')]
-            for p in targets:
+            # quarantine_false_positives.py parks a flagged event's files under _quarantine/
+            rel_path = Path(rel)
+            paths = [rel_path] if rel_path.is_absolute() else [base / rel_path, base / '_quarantine' / rel_path]
+            if key.endswith('_clip'):
+                paths += [p.with_suffix('.json') for p in paths]
+            for p in paths:
                 # The API's delete route and the per-label cap race this thread for the
                 # same files; a file that vanished in between is not an error.
                 try:

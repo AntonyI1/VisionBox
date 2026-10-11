@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -263,6 +264,47 @@ def test_retention_thread_survives_a_failing_pass_and_vanished_files(tmp_path, d
     assert db.get_event('old') is None
     assert calls['n'] >= 2
     assert 'retention pass failed' in caplog.text
+
+
+def test_delete_event_files_reaches_quarantined_media(manager, tmp_path):
+    parked = tmp_path / 'front_door' / '_quarantine' / 'clean' / 'event_q.mp4'
+    parked.parent.mkdir(parents=True)
+    parked.write_bytes(b'x' * 7)
+    parked.with_suffix('.json').write_bytes(b'y' * 3)
+
+    row = {'event_id': 'q', 'camera': 'front_door', 'clean_clip': 'clean/event_q.mp4', 'quarantined': 1}
+    assert manager._delete_event_files(row) == 10
+    assert not any(parked.parent.iterdir())
+
+
+def test_start_settles_rows_a_crash_left_open(tmp_path, db, fake_ffmpeg):
+    out = tmp_path / 'front_door'
+    started = datetime(2026, 1, 1, 12, 0, 0)
+    db.insert_event('kept', started, camera='front_door', clean_clip='clean/event_kept.mp4',
+                    annotated_clip='annotated/event_kept.mp4')
+    db.insert_event('gone', started, camera='front_door', clean_clip='clean/event_gone.mp4',
+                    annotated_clip='annotated/event_gone.mp4')
+    db.insert_event('other', started, camera='backyard', clean_clip='clean/event_other.mp4')
+    kept_clip = out / 'clean' / 'event_kept.mp4'
+    kept_clip.parent.mkdir(parents=True)
+    kept_clip.write_bytes(b'x' * 60000)
+    ended = (started + timedelta(seconds=42)).timestamp()
+    os.utime(kept_clip, (ended, ended))
+    stub = out / 'annotated' / 'event_gone.mp4'
+    stub.parent.mkdir(parents=True)
+    stub.write_bytes(b'x')
+
+    mgr = RecordingManager(_config(), camera='front_door', output_dir=out, db=db)
+    mgr.start()
+    mgr.stop()
+
+    kept = db.get_event('kept')
+    assert kept['end_time'] == (started + timedelta(seconds=42)).isoformat()
+    assert kept['duration'] == 42.0
+    assert kept['annotated_clip'] == ''  # the annotated file never made it to disk
+    assert kept_clip.exists()
+    assert db.get_event('gone') is None and not stub.exists()
+    assert db.get_event('other')['end_time'] is None  # another camera's row is not ours to settle
 
 
 def test_storage_budget_spans_all_cameras(tmp_path, db, fake_ffmpeg):
