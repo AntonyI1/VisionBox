@@ -367,7 +367,10 @@ class CameraPipeline:
                     and self.motion.last_coverage >= cfg.motion.global_change_max_fraction
                     and self.motion.quadrant_min >= cfg.motion.global_change_min_quadrant
                     and not self._recent_real_object()):
-                self.motion.relearn(proc_frame, -1)   # fold the new lighting into the model
+                # Rate 1.0 replaces the background with this frame outright; the automatic
+                # rate (-1) would keep the guard firing for a couple of seconds after an
+                # IR-cut, with every real movement in that window dropped.
+                self.motion.relearn(proc_frame, 1.0)
                 motion_regions = []
             merged = merge_overlapping_regions(motion_regions, padding=cfg.motion.merge_padding)
 
