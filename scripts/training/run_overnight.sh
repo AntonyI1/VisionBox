@@ -12,7 +12,7 @@ PY="$ROOT/venv/bin/python"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 # Refresh the COCO-replay regression set (idempotent; needs internet the first time).
-# If it can't be built the gate fails CLOSED (stage-only, no auto-promote) — non-fatal,
+# If it can't be built the gate fails CLOSED (stage-only, no auto-promote) - non-fatal,
 # but nothing will be promoted until the replay baseline exists.
 "$PY" scripts/training/prep_replay.py \
     || echo "[run_overnight] prep_replay unavailable; gate will fail closed (stage only)"

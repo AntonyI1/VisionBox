@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VisionBox network hardening — make host services tailnet-only + cut attack surface.
+# VisionBox network hardening - make host services tailnet-only + cut attack surface.
 #   Review, then run from the repo root:  sudo bash ./harden-network.sh
 #
 # WHAT THIS DOES (host-level, reversible with `sudo ufw disable`):
@@ -8,9 +8,9 @@
 #     => the VisionBox dashboard (host process on :8085) becomes reachable ONLY over
 #        Tailscale (+ localhost), on top of the dashboard login already enabled.
 #   * Disables rpcbind (port 111): the NFS mount is v4.2 (single TCP port, client-
-#     initiated), so rpcbind is not needed — closing it removes a needless surface.
+#     initiated), so rpcbind is not needed - closing it removes a needless surface.
 #
-# NOT done here: Frigate's Docker-published ports bypass ufw — see harden-frigate.sh.
+# NOT done here: Frigate's Docker-published ports bypass ufw - see harden-frigate.sh.
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo: sudo bash $0"; exit 1; }
 
@@ -27,7 +27,7 @@ ufw default allow outgoing
 ufw --force enable
 ufw status verbose
 
-# rpcbind is unnecessary for NFSv4 — stop + disable to close port 111.
+# rpcbind is unnecessary for NFSv4 - stop + disable to close port 111.
 if systemctl is-active --quiet rpcbind || systemctl is-enabled --quiet rpcbind 2>/dev/null; then
   systemctl disable --now rpcbind.socket 2>/dev/null || true
   systemctl disable --now rpcbind 2>/dev/null || true
@@ -41,11 +41,11 @@ cat <<NOTES
 
 --- DONE: host services are now tailnet-only (+ dashboard login). ---
 
-VERIFY from a LAN device that is NOT on Tailscale — the dashboard must NOT load:
+VERIFY from a LAN device that is NOT on Tailscale - the dashboard must NOT load:
     curl --max-time 4 http://${LAN_IP:-<lan-ip>}:8085/        # expect: hang / connection refused
 Over Tailscale (http://${TS_IP:-<tailscale-ip>}:8085/) it should show the dashboard login page.
 
-STILL TO DO (manual — not done automatically):
+STILL TO DO (manual - not done automatically):
   1. Frigate's :5000/:8554/:8555 are published by DOCKER, which BYPASSES ufw.
      Run harden-frigate.sh to filter them in the DOCKER-USER chain (tailnet-only).
      Alternative: bind the compose ports to the Tailscale IP instead, e.g.

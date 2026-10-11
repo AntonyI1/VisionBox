@@ -106,7 +106,7 @@ class MultiModelDetector:
 
     @staticmethod
     def _resolve_ov_device(device: str) -> str:
-        """OpenVINO target for Ultralytics — prefer the Intel iGPU, fall back to CPU.
+        """OpenVINO target for Ultralytics - prefer the Intel iGPU, fall back to CPU.
 
         An explicit 'intel:gpu' is dramatically faster than letting Ultralytics
         default to OpenVINO AUTO on this hardware, so we never rely on AUTO.
@@ -239,14 +239,14 @@ class MultiModelDetector:
 def export_tensorrt(model_name: str = 'yolov8s.pt', imgsz: int = 1280):
     model = YOLO(model_name)
     model.export(format='engine', half=True, imgsz=imgsz)
-    print(f"Exported {model_name} → TensorRT FP16 engine (imgsz={imgsz})")
+    print(f"Exported {model_name} -> TensorRT FP16 engine (imgsz={imgsz})")
 
 
 def export_openvino(model_name: str = 'yolov8n.pt', imgsz: int = 640, half: bool = False):
     """Export a .pt model to OpenVINO IR. Returns the exported *_openvino_model dir path."""
     model = YOLO(model_name)
     out = model.export(format='openvino', imgsz=imgsz, half=half)
-    print(f"Exported {model_name} → OpenVINO IR (imgsz={imgsz}) at {out}")
+    print(f"Exported {model_name} -> OpenVINO IR (imgsz={imgsz}) at {out}")
     return str(out)
 
 

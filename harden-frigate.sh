@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# VisionBox network hardening, part 2 — make Frigate's Docker ports tailnet-only.
+# VisionBox network hardening, part 2 - make Frigate's Docker ports tailnet-only.
 #   Review, then run from the repo root:  sudo bash ./harden-frigate.sh
 #
 # PROBLEM: Docker publishes Frigate's 5000 (UI, no auth) / 8554 (RTSP) / 8555 (WebRTC)
-# on 0.0.0.0 and DNATs traffic in the FORWARD path, which BYPASSES ufw's INPUT rules —
+# on 0.0.0.0 and DNATs traffic in the FORWARD path, which BYPASSES ufw's INPUT rules -
 # so harden-network.sh never protected them and anyone on the LAN can open Frigate.
 #
 # FIX: filter in the DOCKER-USER chain (the supported hook Docker evaluates first for
@@ -21,7 +21,7 @@ RULES=/etc/ufw/after.rules
 MARKER='VISIONBOX-FRIGATE-DOCKER-USER'
 
 if grep -q "$MARKER" "$RULES"; then
-  echo "Rules already installed in $RULES — nothing to do."
+  echo "Rules already installed in $RULES - nothing to do."
 else
   cp -a "$RULES" "${RULES}.bak-$(date +%Y%m%d_%H%M%S)"
   cat >> "$RULES" <<'EOF'
@@ -55,7 +55,7 @@ cat <<NOTES
 
 --- DONE: Frigate (5000/8554/8555) is now tailnet-only. ---
 
-VERIFY from a LAN device that is NOT on Tailscale — Frigate must NOT load:
+VERIFY from a LAN device that is NOT on Tailscale - Frigate must NOT load:
     curl --max-time 4 http://${LAN_IP:-<lan-ip>}:5000/        # expect: timeout
 Over Tailscale it must still work:
     curl --max-time 4 http://${TS_IP:-<tailscale-ip>}:5000/        # expect: HTML

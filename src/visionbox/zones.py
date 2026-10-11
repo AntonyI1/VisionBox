@@ -1,4 +1,4 @@
-"""Detection zones — Frigate-style motion masks and required zones.
+"""Detection zones - Frigate-style motion masks and required zones.
 
 Exclude zones act as motion masks: motion in these areas is suppressed
 so YOLO never runs there. Include zones are required zones: detections
@@ -79,7 +79,7 @@ class ZoneFilter:
     def filter_motion_regions(
         self, regions: list[tuple], frame_shape: tuple
     ) -> list[tuple]:
-        """Motion mask — drop motion regions whose center falls in an exclude zone."""
+        """Motion mask - drop motion regions whose center falls in an exclude zone."""
         if not self.has_exclude:
             return regions
         excludes = self._contours_of('exclude', frame_shape)
@@ -97,7 +97,7 @@ class ZoneFilter:
     def check_required_zones(
         self, detections: list[dict], frame_shape: tuple
     ) -> bool:
-        """Required zones — return True if any detection is inside an include zone.
+        """Required zones - return True if any detection is inside an include zone.
 
         If no include zones are defined, returns True (no restriction).
         """

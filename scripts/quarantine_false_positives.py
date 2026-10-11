@@ -167,7 +167,7 @@ def restore(db_path: str, reason: str | None):
             if dst.exists():
                 src.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(dst), str(src))
-        # row may have been reaped by retention — re-insert if missing
+        # row may have been reaped by retention - re-insert if missing
         if not conn.execute('SELECT 1 FROM events WHERE event_id=?', (e['event_id'],)).fetchone():
             row = e['row']
             cols = [c for c in row if c not in ('quarantined', 'quarantine_reason')]

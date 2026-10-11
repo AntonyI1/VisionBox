@@ -48,7 +48,7 @@ def _redact_url(url: str) -> str:
 
 def _rtsp_ready(url: str, timeout: float = 4.0) -> bool:
     """Liveness probe before the heavy cv2 open. A wedged source (TCP accepts, data
-    never comes) makes every VideoCapture retry churn ffmpeg allocations — days of
+    never comes) makes every VideoCapture retry churn ffmpeg allocations - days of
     that fragments the heap until av_frame_get_buffer fails for ALL cameras. Any
     RTSP status line counts as alive (401/454 still prove the server talks);
     timeout, refusal, or an empty reply means don't bother opening."""
@@ -67,7 +67,7 @@ def _rtsp_ready(url: str, timeout: float = 4.0) -> bool:
 
 
 class CameraStream:
-    """Threaded RTSP reader — always returns the latest frame."""
+    """Threaded RTSP reader - always returns the latest frame."""
 
     def __init__(self, source):
         self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
@@ -171,7 +171,7 @@ def _overlaps_motion(det_box, motion_boxes):
 
 
 class CameraPipeline:
-    """Per-camera worker: capture → motion → detect → track → record."""
+    """Per-camera worker: capture -> motion -> detect -> track -> record."""
 
     def __init__(
         self,
@@ -587,7 +587,7 @@ class CameraPipeline:
         tcfg = self.cfg.tracker
         hist = self._track_positions.get(tid)
         if not hist or len(hist) < tcfg.stationary_min_samples:
-            return False  # not enough measured evidence yet — don't trigger on a brand-new track
+            return False  # not enough measured evidence yet - don't trigger on a brand-new track
         now = hist[-1][2]
         recent = [p for p in hist if now - p[2] <= tcfg.stationary_window]
         if len(recent) < tcfg.stationary_min_samples:
@@ -611,7 +611,7 @@ class CameraPipeline:
 
     def _is_track_confirmed(self, tid: int) -> bool:
         """True once a track has at least confirm_min_count detections whose median
-        score crosses the threshold — kills single-frame flicker without penalising
+        score crosses the threshold - kills single-frame flicker without penalising
         short or mid-confidence tracks (Frigate-style)."""
         scores = self._track_scores.get(tid)
         if not scores or len(scores) < self.cfg.detection.confirm_min_count:

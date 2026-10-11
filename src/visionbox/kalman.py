@@ -1,6 +1,6 @@
 """Kalman filter for bounding box tracking.
 
-State: [x, y, w, h, vx, vy, vw, vh] — position + velocity in center/size format.
+State: [x, y, w, h, vx, vy, vw, vh] - position + velocity in center/size format.
 """
 
 import numpy as np
@@ -39,7 +39,7 @@ class KalmanBoxTracker:
             [0, 0, 0, 1, 0, 0, 0, 0],
         ], dtype=float)
 
-        # Tuned for 5 FPS detection with 15 FPS loop —
+        # Tuned for 5 FPS detection with 15 FPS loop -
         # high velocity noise so filter doesn't overcommit between detections
         self.Q = np.diag([10, 10, 10, 10, 50, 50, 1, 1])
         self.R = np.diag([5, 5, 15, 15])

@@ -474,7 +474,7 @@
                 .catch(() => {});
         };
         img.onerror = function () {
-            zoneEmpty.textContent = 'Camera not connected — cannot get snapshot.';
+            zoneEmpty.textContent = 'Camera not connected - cannot get snapshot.';
             zoneEmpty.style.display = 'block';
             zoneCanvas.style.display = 'none';
         };
@@ -890,7 +890,7 @@
         const hadController = !!navigator.serviceWorker.controller;
         let reloaded = false;
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-            // An updated worker claimed the page (skipWaiting) — reload once for a fresh shell.
+            // An updated worker claimed the page (skipWaiting) - reload once for a fresh shell.
             if (!hadController || reloaded) return;
             reloaded = true;
             location.reload();

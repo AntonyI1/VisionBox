@@ -212,7 +212,7 @@ def create_app(state: CamerasState) -> Flask:
 
         logger.info('dashboard auth: ENABLED (login page + Basic)')
     else:
-        logger.warning('dashboard auth: DISABLED — set VISIONBOX_AUTH_USER/PASS in .env')
+        logger.warning('dashboard auth: DISABLED - set VISIONBOX_AUTH_USER/PASS in .env')
 
     def _get_view(name: str) -> CameraView:
         if name not in state.views:
@@ -510,7 +510,7 @@ def create_app(state: CamerasState) -> Flask:
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / f'{name}_{filename}'  # camera prefix avoids cross-camera name collisions
         shutil.move(str(src), str(dest))
-        logger.info('Approved %s/%s/%s → training', name, class_name, filename)
+        logger.info('Approved %s/%s/%s -> training', name, class_name, filename)
         return jsonify({'action': 'approved', 'file': filename})
 
     @app.route('/api/cameras/<name>/review/<class_name>/<filename>/reject', methods=['POST'])
@@ -776,7 +776,7 @@ def _next_jpeg(view: CameraView, last_sent: int) -> tuple[bytes | None, int]:
 
 def _encode_loop(view: CameraView):
     # One shared encoder per camera: encodes each produced frame at most once and
-    # fans the bytes out to every /stream client. Blocks (≈0 CPU) while unwatched;
+    # fans the bytes out to every /stream client. Blocks (~0 CPU) while unwatched;
     # imencode always runs OUTSIDE the lock on a reference copied under it (the
     # producer rebinds view.frame to a fresh array each tick, never mutates in place).
     cond = view.frame_cond
@@ -813,7 +813,7 @@ def start_api_server(state: CamerasState, port: int, host: str = '0.0.0.0') -> t
         except OSError as exc:
             # A bad bind_host / taken port must fail LOUDLY (systemd restarts + logs),
             # not die silently in this daemon thread while main() waits forever.
-            logger.error('API server could not bind %s:%s — %s', host, port, exc)
+            logger.error('API server could not bind %s:%s - %s', host, port, exc)
             os._exit(1)
 
     thread = threading.Thread(target=_serve, daemon=True, name='api-server')
