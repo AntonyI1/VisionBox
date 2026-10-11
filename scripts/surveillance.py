@@ -33,7 +33,7 @@ import numpy as np
 
 from visionbox import CLASS_PRESETS_V2, MotionDetector, Tracker, merge_overlapping_regions
 from visionbox.api import CamerasState, CameraView, start_api_server
-from visionbox.config import CameraConfig, VisionBoxConfig, load_config
+from visionbox.config import CameraConfig, ConfigError, VisionBoxConfig, load_config
 from visionbox.database import RecordingDatabase
 from visionbox.detector_v2 import ModelConfig, MultiModelDetector
 from visionbox.recording_manager import RecordingManager
@@ -699,7 +699,14 @@ def main():
                         help='Do not auto-open the browser')
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    # A missing file would quietly mean "defaults": no cameras, a UI-only process and a
+    # database in the current directory. Say so instead.
+    if not Path(args.config).is_file():
+        sys.exit(f"config: {args.config} not found (run from the checkout or pass --config)")
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        sys.exit(f"config: {exc}")
     init_global_storage(cfg)
 
     output_dir = Path(cfg.recording.output_dir)
