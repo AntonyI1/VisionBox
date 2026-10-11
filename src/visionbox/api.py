@@ -36,6 +36,7 @@ _OFFLINE_JPEG = cv2.imencode('.jpg', np.zeros((9, 16, 3), dtype=np.uint8))[1].to
 
 _IMAGE_SUFFIXES = ('.jpg', '.jpeg', '.png')
 _ZONE_NAME_RE = re.compile(r'[\w .-]{1,32}')
+_URL_CREDENTIALS_RE = re.compile(r'://[^/@]*@')
 
 
 _LOGIN_PAGE = """<!doctype html>
@@ -338,8 +339,8 @@ def create_app(state: CamerasState) -> Flask:
 
     @app.route('/api/events')
     def events():
-        limit = min(request.args.get('limit', 50, type=int), 200)
-        offset = request.args.get('offset', 0, type=int)
+        limit = max(1, min(request.args.get('limit', 50, type=int), 200))  # LIMIT -1 is unbounded in SQLite
+        offset = max(0, request.args.get('offset', 0, type=int))
         camera = request.args.get('camera') or None
         rows = state.db.get_events(limit=limit, offset=offset, camera=camera)
         total = state.db.get_event_count(camera=camera)
@@ -363,12 +364,9 @@ def create_app(state: CamerasState) -> Flask:
             path = _event_path(state, event, key)
             if path is None:
                 continue
-            if path.exists():
-                path.unlink()
+            path.unlink(missing_ok=True)  # retention may be removing the same event
             if key.endswith('_clip'):
-                meta = path.with_suffix('.json')
-                if meta.exists():
-                    meta.unlink()
+                path.with_suffix('.json').unlink(missing_ok=True)
         state.db.delete_event(event_id)
         return jsonify({'deleted': event_id})
 
@@ -445,7 +443,8 @@ def create_app(state: CamerasState) -> Flask:
 
     @app.route('/api/config')
     def config():
-        return jsonify(asdict(state.config) if state.config else {})
+        # Camera URLs may carry RTSP credentials; the dashboard never needs them.
+        return jsonify(_redacted(asdict(state.config)) if state.config else {})
 
     # ----- Zones (per camera) -----
 
@@ -609,7 +608,14 @@ def _scan_recordings_bytes(state: CamerasState) -> int:
     out = state.output_dir
     if not out.exists():
         return 0
-    return sum(f.stat().st_size for f in out.rglob('*') if f.is_file())
+    total = 0
+    for f in out.rglob('*'):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except FileNotFoundError:  # retention removed it mid-walk
+            continue
+    return total
 
 
 def _build_storage_info(state: CamerasState, recordings_bytes: int) -> dict:
@@ -669,6 +675,17 @@ def _get_storage_info(state: CamerasState) -> dict:
 
 def _is_unit_coordinate(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+
+
+def _redacted(obj):
+    """Strip user:password@ from every URL-looking string in a config dump."""
+    if isinstance(obj, str):
+        return _URL_CREDENTIALS_RE.sub('://***@', obj)
+    if isinstance(obj, dict):
+        return {k: _redacted(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redacted(v) for v in obj]
+    return obj
 
 
 def _safe_path(base: Path, *parts: str) -> Path:

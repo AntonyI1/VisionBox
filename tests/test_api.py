@@ -7,6 +7,7 @@ import pytest
 from werkzeug.exceptions import BadRequest
 
 from visionbox import api
+from visionbox.config import CameraConfig, VisionBoxConfig
 
 USER, PASSWORD = 'admin', 'correct horse'
 HTML = {'Accept': 'text/html,application/xhtml+xml'}
@@ -37,6 +38,10 @@ class FakeDB:
 
     def get_camera_counts(self):
         return {}
+
+    def get_events(self, limit=50, offset=0, camera=None):
+        rows = [e for e in self.events.values() if not camera or e.get('camera') == camera]
+        return rows[offset:offset + limit]
 
     def delete_event(self, event_id):
         self.events.pop(event_id, None)
@@ -243,7 +248,30 @@ def test_stream_sends_a_placeholder_until_the_camera_produces_a_frame(client, st
     assert view.stream_clients == 0
 
 
+def test_config_dump_hides_camera_credentials(state, no_auth_env):
+    cfg = VisionBoxConfig()
+    cfg.cameras['gate'] = CameraConfig(name='gate', url='rtsp://admin:s3cret@192.0.2.10:554/stream1',
+                                       detect_url='rtsp://127.0.0.1:8554/gate_sub')
+    state.config = cfg
+    client = api.create_app(state).test_client()
+
+    resp = client.get('/api/config')
+    dump = resp.get_json()
+    assert dump['cameras']['gate']['url'] == 'rtsp://***@192.0.2.10:554/stream1'
+    assert dump['cameras']['gate']['detect_url'] == 'rtsp://127.0.0.1:8554/gate_sub'
+    assert 's3cret' not in resp.get_data(as_text=True)
+
+
 # ----- Events -----
+
+def test_events_listing_clamps_paging_arguments(client, state):
+    state.db = FakeDB({f'e{i}': {'event_id': f'e{i}', 'camera': 'front'} for i in range(5)})
+
+    data = client.get('/api/events?limit=-1&offset=-3').get_json()
+    assert (data['limit'], data['offset'], len(data['events'])) == (1, 0, 1)
+    assert client.get('/api/events?limit=999').get_json()['limit'] == 200
+    assert len(client.get('/api/events?limit=2&offset=4').get_json()['events']) == 1
+
 
 def test_event_media_resolves_relative_to_camera_dir(client, state):
     cam_dir = state.output_dir / 'front'
