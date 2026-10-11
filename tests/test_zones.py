@@ -69,6 +69,7 @@ def test_add_and_remove_zone_persist_to_disk(zones_path):
 
     zf.add_zone(Zone(name='street', type='exclude', points=LEFT_HALF))
     assert json.loads(zones_path.read_text()) == [{'name': 'street', 'type': 'exclude', 'points': LEFT_HALF}]
+    assert [p.name for p in zones_path.parent.iterdir()] == [zones_path.name]  # no temp file left behind
     assert zf.filter_detections([{'box': LEFT_BOX}], SHAPE) == []
 
     zf.add_zone(Zone(name='street', type='exclude', points=RIGHT_HALF))

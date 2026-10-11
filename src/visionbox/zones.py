@@ -6,6 +6,7 @@ must fall inside one to trigger recording.
 """
 
 import json
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,7 +42,11 @@ class ZoneFilter:
             self._zones = []
 
     def save(self):
-        self._path.write_text(json.dumps(self.get_zones(), indent=2))
+        # Written whole then swapped in: a crash mid-write must not leave a file that
+        # load() rejects, which would silently drop every mask and required zone.
+        tmp = self._path.with_name(self._path.name + '.tmp')
+        tmp.write_text(json.dumps(self.get_zones(), indent=2))
+        os.replace(tmp, self._path)
 
     def add_zone(self, zone: Zone):
         with self._lock:
@@ -116,14 +121,17 @@ class ZoneFilter:
         return any(cv2.pointPolygonTest(c, (cx, cy), False) >= 0 for c in contours)
 
     def _get_contours(self, w: int, h: int) -> dict[str, np.ndarray]:
-        if self._cache_resolution == (w, h):
+        # The pipeline thread reads while the API thread edits; building the cache under
+        # the same lock means an edit can never be published into a cache built from the
+        # zone list it replaced.
+        with self._lock:
+            if self._cache_resolution != (w, h):
+                self._cache_contours = {
+                    z.name: np.array([[p[0] * w, p[1] * h] for p in z.points], dtype=np.float32)
+                    for z in self._zones
+                }
+                self._cache_resolution = (w, h)
             return self._cache_contours
-        self._cache_contours = {
-            z.name: np.array([[p[0] * w, p[1] * h] for p in z.points], dtype=np.float32)
-            for z in self._zones
-        }
-        self._cache_resolution = (w, h)
-        return self._cache_contours
 
     def _invalidate_cache(self):
         self._cache_resolution = None
