@@ -19,11 +19,14 @@ FRAME = np.zeros((48, 64, 3), dtype=np.uint8)
 
 
 class FakeFFmpeg:
-    """Stands in for the annotated recorder's ffmpeg pipe."""
+    """Stands in for the annotated recorder's ffmpeg pipe, leaving a plausible clip behind."""
 
     def __init__(self, cmd, **kwargs):
         self.cmd = cmd
         self.stdin = io.BytesIO()
+        out = Path(cmd[-1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b'\x00' * 8192)
 
     def wait(self, timeout=None):
         return 0
@@ -156,6 +159,27 @@ def test_clean_clip_that_ffmpeg_abandoned_is_dropped_from_the_row(tmp_path, db, 
     assert db.get_event(event_id)['clean_clip'] == ''
     assert list((out / 'clean').iterdir()) == []  # stub clip and ffmpeg log both removed
     assert 'Connection refused' in caplog.text
+    mgr.stop()
+
+
+def test_annotated_clip_that_never_started_is_dropped_from_the_row(tmp_path, db, monkeypatch, caplog):
+    def no_ffmpeg(cmd, **kwargs):
+        raise OSError('ffmpeg: not found')
+
+    monkeypatch.setattr(subprocess, 'Popen', no_ffmpeg)
+    out = tmp_path / 'front_door'
+    mgr = RecordingManager(_config(), camera='front_door', output_dir=out, db=db)
+
+    mgr.update(FRAME, None, triggered=True, detections=[_person()])
+    event_id = mgr.event_id
+    assert db.get_event(event_id)['annotated_clip'].startswith('annotated/event_')
+    mgr.update(FRAME, None, triggered=False)
+    mgr.update(FRAME, None, triggered=False)
+
+    assert not mgr.is_recording
+    assert db.get_event(event_id)['annotated_clip'] == ''
+    assert list((out / 'annotated').iterdir()) == []  # no orphaned sidecar either
+    assert 'could not start ffmpeg' in caplog.text
     mgr.stop()
 
 

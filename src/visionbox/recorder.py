@@ -1,9 +1,10 @@
 """Event-based video recorder with state machine.
 
-State: IDLE → RECORDING → COOLDOWN → IDLE
+State: IDLE -> RECORDING -> COOLDOWN -> IDLE
 """
 
 import json
+import logging
 import subprocess
 import time
 from contextlib import suppress
@@ -13,6 +14,8 @@ from enum import Enum
 from pathlib import Path
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class RecorderState(Enum):
@@ -117,7 +120,9 @@ class EventRecorder:
             '-i', 'pipe:0',
             '-c:v', 'libx264', '-preset', 'ultrafast',
             '-crf', '23', '-pix_fmt', 'yuv420p',
-            '-movflags', '+faststart',
+            # Fragmented MP4: the clip stays playable if ffmpeg has to be killed at
+            # stop, where +faststart would leave a file without its moov atom.
+            '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
             str(self._current_path),
         ]
 
@@ -126,7 +131,8 @@ class EventRecorder:
                 cmd, stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-        except OSError:
+        except OSError as exc:
+            logger.warning('annotated recorder could not start ffmpeg: %s', exc)
             self._process = None
 
         self._meta = EventMetadata(start_time=datetime.now().isoformat())

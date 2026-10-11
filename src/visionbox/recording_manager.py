@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from collections import Counter
+from contextlib import suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,9 @@ logger = logging.getLogger(__name__)
 # The storage budget covers the whole recordings tree, so only one camera's
 # retention thread may measure and trim it at a time.
 _storage_budget_lock = threading.Lock()
+
+# An annotated clip smaller than this holds no frames: ffmpeg wrote its headers and died.
+ANNOTATED_MIN_BYTES = 4096
 
 # Best-snapshot scoring (Frigate-style): prefer big, confident, non-edge boxes.
 EDGE_MARGIN_FRAC = 0.02   # a box side within 2% of a border counts as "touching"
@@ -216,6 +220,7 @@ class RecordingManager:
     def _reset_event_state(self):
         self._current_event_id = None
         self._event_start = None
+        self._annotated_rel = ''
         self._detection_counts.clear()
         self._best_thumb = None
         self._best_snapshot = None
@@ -243,6 +248,7 @@ class RecordingManager:
         annotated_clip = ''
         if self.annotated and self.annotated.event_id:
             annotated_clip = f'annotated/event_{self.annotated.event_id}.mp4'
+        self._annotated_rel = annotated_clip
 
         self.db.insert_event(
             event_id=event_id, start_time=now, camera=self.camera,
@@ -263,6 +269,20 @@ class RecordingManager:
             clean_path = self.clean.stop_event()
             if clean_path is None:
                 self.db.update_event_clean_clip(self._current_event_id, '')
+
+        if self._annotated_rel:
+            # The annotated recorder has already closed its ffmpeg; a clip that never
+            # grew past its headers (or never appeared) would 404 in the dashboard.
+            clip = self.output_dir / self._annotated_rel
+            size = clip.stat().st_size if clip.exists() else -1
+            if size < ANNOTATED_MIN_BYTES:
+                logger.warning('[%s] annotated clip for %s is %s; dropping it from the event',
+                               self.camera or 'default', self._current_event_id,
+                               'missing' if size < 0 else f'{size} bytes')
+                with suppress(OSError):
+                    clip.unlink(missing_ok=True)
+                    clip.with_suffix('.json').unlink(missing_ok=True)
+                self.db.update_event_annotated_clip(self._current_event_id, '')
 
         top_label = ''
         total_detections = sum(self._detection_counts.values())
@@ -448,10 +468,7 @@ class RecordingManager:
         self._timer_state = RecorderState.IDLE
 
     def stop(self):
-        if self._current_event_id:
-            self._end_event()
-        if self.annotated:
-            self.annotated.release()
+        self.abort()
         if self.clean:
             self.clean.release()
         self._retention_stop.set()
