@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 _STREAM_KEEPALIVE_S = 2.0
 
 _IMAGE_SUFFIXES = ('.jpg', '.jpeg', '.png')
+_ZONE_NAME_RE = re.compile(r'[\w .-]{1,32}')
 
 
 _LOGIN_PAGE = """<!doctype html>
@@ -451,22 +452,23 @@ def create_app(state: CamerasState) -> Flask:
     @app.route('/api/cameras/<name>/zones', methods=['POST'])
     def add_zone(name):
         zf = _get_zone_filter(name)
-        data = request.get_json() or {}
-        zname = data.get('name', '').strip()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'error': 'JSON object required'}), 400
+        zname = data.get('name')
         ztype = data.get('type', '')
         points = data.get('points', [])
-        if not zname:
-            return jsonify({'error': 'Name required'}), 400
+        # The name is shown in the dashboard and becomes part of the DELETE URL.
+        if not isinstance(zname, str) or not _ZONE_NAME_RE.fullmatch(zname.strip()):
+            return jsonify({'error': 'Name must be 1-32 letters, digits, spaces, dots, dashes or underscores'}), 400
         if ztype not in ('include', 'exclude'):
             return jsonify({'error': 'Type must be include or exclude'}), 400
         if not isinstance(points, list) or len(points) < 3:
             return jsonify({'error': 'At least 3 points required'}), 400
         for p in points:
-            if not isinstance(p, list) or len(p) != 2:
-                return jsonify({'error': 'Points must be [x, y] pairs'}), 400
-            if not all(0 <= v <= 1 for v in p):
-                return jsonify({'error': 'Coordinates must be 0-1'}), 400
-        zf.add_zone(Zone(name=zname, type=ztype, points=points))
+            if not isinstance(p, list) or len(p) != 2 or not all(_is_unit_coordinate(v) for v in p):
+                return jsonify({'error': 'Points must be [x, y] pairs with coordinates 0-1'}), 400
+        zf.add_zone(Zone(name=zname.strip(), type=ztype, points=points))
         return jsonify({'ok': True})
 
     @app.route('/api/cameras/<name>/zones/<zname>', methods=['DELETE'])
@@ -658,6 +660,10 @@ def _get_storage_info(state: CamerasState) -> dict:
         threading.Thread(target=_refresh_storage_cache, args=(state,),
                          daemon=True, name='storage-refresh').start()
     return cached if cached is not None else _build_storage_info(state, 0)
+
+
+def _is_unit_coordinate(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
 
 
 def _safe_path(base: Path, *parts: str) -> Path:

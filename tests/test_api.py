@@ -280,6 +280,37 @@ def test_delete_event_removes_files_and_sidecars(client, state):
     assert client.delete('/api/events/e1').status_code == 404
 
 
+# ----- Zones -----
+
+def test_zone_names_and_points_are_validated(client, state):
+    state.zones_dir.mkdir()
+    (state.zones_dir / 'cam.json').write_text('[]')
+    url = '/api/cameras/cam/zones'
+    good = {'name': ' porch ', 'type': 'include', 'points': [[0, 0], [1, 0], [0.5, 1]]}
+
+    assert client.post(url, json=good).status_code == 200
+    assert client.get(url).get_json() == [{'name': 'porch', 'type': 'include', 'points': [[0, 0], [1, 0], [0.5, 1]]}]
+
+    for bad in (
+        {**good, 'name': '<img src=x onerror=alert(1)>'},
+        {**good, 'name': 'a/b'},
+        {**good, 'name': 123},
+        {**good, 'name': ''},
+        {**good, 'type': 'maybe'},
+        {**good, 'points': [[0, 0], [1, 0]]},
+        {**good, 'points': [['0.1', '0.2'], [1, 0], [0.5, 1]]},
+        {**good, 'points': [[True, 0], [1, 0], [0.5, 1]]},
+        {**good, 'points': [[0, 1.5], [1, 0], [0.5, 1]]},
+    ):
+        resp = client.post(url, json=bad)
+        assert resp.status_code == 400 and 'error' in resp.get_json(), bad
+    assert client.post(url, data='"not an object"', content_type='application/json').status_code == 400
+    assert client.post(url, data='name=porch').status_code == 400
+
+    assert client.delete(url + '/porch').get_json() == {'deleted': 'porch'}
+    assert client.delete(url + '/porch').status_code == 404
+
+
 # ----- Review and training -----
 
 def test_review_aggregates_cameras_and_routes_actions_per_camera(client, state):
