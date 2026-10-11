@@ -28,9 +28,29 @@
             ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     }
 
+    function esc(value) {
+        return String(value).replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+        })[c]);
+    }
+
+    // Every API call goes through here. The server only redirects navigations to the
+    // login page, so an expired session shows up to fetch() as a 401: send the browser
+    // there instead of leaving the page quietly frozen on stale data.
+    function api(url, opts) {
+        return fetch(url, opts).then(r => {
+            if (r.status === 401) {
+                location.assign('/login?next=' + encodeURIComponent(location.pathname));
+                throw new Error('session expired');
+            }
+            if (!r.ok) throw new Error(url + ' -> HTTP ' + r.status);
+            return r.json();
+        });
+    }
+
     function metaRow(label, value) {
         return '<div class="meta-row"><span class="meta-label">' + label +
-            '</span><span class="meta-value">' + value + '</span></div>';
+            '</span><span class="meta-value">' + esc(value) + '</span></div>';
     }
 
     function option(value, text) {
@@ -86,8 +106,7 @@
     // ---------- Global status polling ----------
 
     function pollStatus() {
-        fetch('/api/status')
-            .then(r => r.json())
+        api('/api/status')
             .then(data => {
                 document.getElementById('status-cams').textContent =
                     data.connected_cameras + '/' + data.cameras + ' cameras';
@@ -106,8 +125,7 @@
     }
 
     function pollCameras() {
-        fetch('/api/cameras')
-            .then(r => r.json())
+        api('/api/cameras')
             .then(data => {
                 const newNames = data.map(c => c.name).sort();
                 const namesChanged =
@@ -200,7 +218,7 @@
                 '</div>' +
                 '<div class="tile-bar">' +
                 '<span class="tile-dot"></span>' +
-                '<span class="tile-name">' + cam.name + '</span>' +
+                '<span class="tile-name">' + esc(cam.name) + '</span>' +
                 '<span class="tile-fps"></span>' +
                 '</div>';
             tile.addEventListener('click', () => openFocus(cam.name));
@@ -287,8 +305,7 @@
 
     function loadEvents() {
         const camQ = eventsFilter ? '&camera=' + encodeURIComponent(eventsFilter) : '';
-        fetch('/api/events?limit=' + PAGE_SIZE + '&offset=' + eventsOffset + camQ)
-            .then(r => r.json())
+        api('/api/events?limit=' + PAGE_SIZE + '&offset=' + eventsOffset + camQ)
             .then(data => {
                 eventsTotal = data.total;
                 if (data.events.length === 0 && eventsOffset === 0) {
@@ -313,7 +330,7 @@
         card.className = 'event-card';
         card.dataset.eventId = ev.event_id;
         const thumbEl = ev.thumbnail
-            ? '<img class="thumb" src="/api/events/' + ev.event_id + '/thumbnail" loading="lazy" alt="">'
+            ? '<img class="thumb" src="/api/events/' + encodeURIComponent(ev.event_id) + '/thumbnail" loading="lazy" alt="">'
             : '<div class="thumb-placeholder">No thumbnail</div>';
         const time = fmtTime(ev.start_time);
         const dur = ev.duration ? ev.duration.toFixed(1) + 's' : '--';
@@ -324,11 +341,11 @@
             '<div class="card-info">' +
             '<div class="card-time">' + time + '</div>' +
             '<div class="card-details">' +
-            (cam ? '<span class="card-cam">' + cam + '</span>' : '') +
+            (cam ? '<span class="card-cam">' + esc(cam) + '</span>' : '') +
             '<span>' + dur + '</span>' +
             '<span>' + dets + ' det</span>' +
             '</div>' +
-            (label ? '<span class="card-label">' + label + '</span>' : '') +
+            (label ? '<span class="card-label">' + esc(label) + '</span>' : '') +
             '</div>';
         card.addEventListener('click', () => openModal(ev.event_id));
         return card;
@@ -343,8 +360,7 @@
 
     function openModal(eventId) {
         modalEventId = eventId;
-        fetch('/api/events/' + eventId)
-            .then(r => r.json())
+        api('/api/events/' + encodeURIComponent(eventId))
             .then(ev => {
                 modalTitle.textContent = (ev.camera || 'Event') + '  ·  ' + (ev.event_id || '');
                 const clipType = ev.clean_clip ? 'clean' : 'annotated';
@@ -366,7 +382,7 @@
     }
 
     function setClipSource(eventId, type) {
-        modalVideo.src = '/api/events/' + eventId + '/clip/' + type;
+        modalVideo.src = '/api/events/' + encodeURIComponent(eventId) + '/clip/' + type;
         modalVideo.load();
     }
 
@@ -394,8 +410,7 @@
     document.getElementById('modal-delete').addEventListener('click', () => {
         if (!modalEventId) return;
         if (!confirm('Delete this event and its recordings?')) return;
-        fetch('/api/events/' + modalEventId, { method: 'DELETE' })
-            .then(r => r.json())
+        api('/api/events/' + encodeURIComponent(modalEventId), { method: 'DELETE' })
             .then(() => {
                 const card = eventsGrid.querySelector(
                     '[data-event-id="' + modalEventId + '"]'
@@ -450,13 +465,13 @@
             zoneCanvas.height = img.naturalHeight;
             zoneCanvas.style.display = 'block';
             zoneEmpty.style.display = 'none';
-            fetch('/api/cameras/' + encodeURIComponent(zonesCurrentCam) + '/zones')
-                .then(r => r.json())
+            api('/api/cameras/' + encodeURIComponent(zonesCurrentCam) + '/zones')
                 .then(data => {
                     zones = data;
                     renderZoneList();
                     drawZoneCanvas();
-                });
+                })
+                .catch(() => {});
         };
         img.onerror = function () {
             zoneEmpty.textContent = 'Camera not connected — cannot get snapshot.';
@@ -592,18 +607,20 @@
     zoneSaveBtn.addEventListener('click', () => {
         const name = zoneNameInput.value.trim();
         if (!name || drawingPoints.length < 3 || !zonesCurrentCam) return;
-        fetch('/api/cameras/' + encodeURIComponent(zonesCurrentCam) + '/zones', {
+        api('/api/cameras/' + encodeURIComponent(zonesCurrentCam) + '/zones', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, type: zoneType, points: drawingPoints }),
         })
-        .then(r => r.json())
         .then(() => {
+            // The server replaces a zone of the same name; mirror that instead of listing it twice.
+            zones = zones.filter(z => z.name !== name);
             zones.push({ name, type: zoneType, points: drawingPoints.slice() });
             cancelZoneDrawing();
             renderZoneList();
             drawZoneCanvas();
-        });
+        })
+        .catch(err => { zoneHint.textContent = 'Could not save zone: ' + err.message; zoneHint.style.display = 'block'; });
     });
 
     function renderZoneList() {
@@ -611,19 +628,27 @@
         zones.forEach(z => {
             const item = document.createElement('div');
             item.className = 'zone-item';
-            item.innerHTML =
-                '<span class="zone-badge ' + z.type + '">' + z.type + '</span>' +
-                '<span class="zone-name">' + z.name + '</span>' +
-                '<button class="zone-del-btn" title="Delete">&times;</button>';
-            item.querySelector('.zone-del-btn').addEventListener('click', () => {
-                fetch('/api/cameras/' + encodeURIComponent(zonesCurrentCam) +
-                      '/zones/' + encodeURIComponent(z.name), { method: 'DELETE' })
+            const badge = document.createElement('span');
+            badge.className = 'zone-badge ' + (z.type === 'include' ? 'include' : 'exclude');
+            badge.textContent = z.type;
+            const name = document.createElement('span');
+            name.className = 'zone-name';
+            name.textContent = z.name;   // user-entered: never interpolate into markup
+            const del = document.createElement('button');
+            del.className = 'zone-del-btn';
+            del.title = 'Delete';
+            del.innerHTML = '&times;';
+            del.addEventListener('click', () => {
+                api('/api/cameras/' + encodeURIComponent(zonesCurrentCam) +
+                    '/zones/' + encodeURIComponent(z.name), { method: 'DELETE' })
                     .then(() => {
                         zones = zones.filter(zz => zz.name !== z.name);
                         renderZoneList();
                         drawZoneCanvas();
-                    });
+                    })
+                    .catch(() => {});
             });
+            item.append(badge, name, del);
             zoneList.appendChild(item);
         });
     }
@@ -654,13 +679,13 @@
         const url = reviewCam
             ? '/api/cameras/' + encodeURIComponent(reviewCam) + '/review/classes'
             : '/api/review/classes';
-        fetch(url)
-            .then(r => r.json())
+        api(url)
             .then(classes => {
                 reviewClassSelect.innerHTML = '<option value="">Select class...</option>';
                 classes.forEach(c => reviewClassSelect.appendChild(option(c.name, c.name + ' (' + c.count + ')')));
                 if (reviewClass) reviewClassSelect.value = reviewClass;
-            });
+            })
+            .catch(() => {});
     }
 
     reviewClassSelect.addEventListener('change', () => {
@@ -675,8 +700,7 @@
         const url = (reviewCam
             ? '/api/cameras/' + encodeURIComponent(reviewCam) + '/review/' + encodeURIComponent(reviewClass)
             : '/api/review/' + encodeURIComponent(reviewClass)) + '?offset=' + reviewOffset;
-        fetch(url)
-            .then(r => r.json())
+        api(url)
             .then(data => {
                 reviewTotal = data.total;
                 if (!data.crop || data.total === 0) {
@@ -701,7 +725,8 @@
                 if (crop.confidence != null) meta += metaRow('Confidence', Math.round(crop.confidence * 100) + '%');
                 if (crop.timestamp) meta += metaRow('Time', fmtTime(crop.timestamp));
                 reviewMeta.innerHTML = meta;
-            });
+            })
+            .catch(() => {});
     }
 
     function clearReview() {
@@ -721,8 +746,7 @@
         const url = '/api/cameras/' + encodeURIComponent(cam) +
                     '/review/' + encodeURIComponent(reviewClass) +
                     '/' + encodeURIComponent(filename) + '/' + action;
-        fetch(url, { method: 'POST' })
-            .then(r => r.json())
+        api(url, { method: 'POST' })
             .then(() => {
                 reviewTotal--;
                 if (reviewTotal <= 0) {
@@ -733,7 +757,8 @@
                 }
                 if (reviewOffset >= reviewTotal) reviewOffset = reviewTotal - 1;
                 loadReviewCrop();
-            });
+            })
+            .catch(() => {});
     }
 
     document.getElementById('review-approve').addEventListener('click', () => reviewAction('approve'));
@@ -766,13 +791,13 @@
     let trainingTotal = 0;
 
     function loadTrainingClasses() {
-        fetch('/api/training/classes')
-            .then(r => r.json())
+        api('/api/training/classes')
             .then(classes => {
                 trainingClassSelect.innerHTML = '<option value="">Select class...</option>';
                 classes.forEach(c => trainingClassSelect.appendChild(option(c.name, c.name + ' (' + c.count + ')')));
                 if (trainingClass) trainingClassSelect.value = trainingClass;
-            });
+            })
+            .catch(() => {});
     }
 
     trainingClassSelect.addEventListener('change', () => {
@@ -784,8 +809,7 @@
 
     function loadTrainingImage() {
         if (!trainingClass) return;
-        fetch('/api/training/' + encodeURIComponent(trainingClass) + '?offset=' + trainingOffset)
-            .then(r => r.json())
+        api('/api/training/' + encodeURIComponent(trainingClass) + '?offset=' + trainingOffset)
             .then(data => {
                 trainingTotal = data.total;
                 if (!data.image || data.total === 0) {
@@ -807,7 +831,8 @@
                 if (img.confidence != null) meta += metaRow('Confidence', Math.round(img.confidence * 100) + '%');
                 if (img.timestamp) meta += metaRow('Time', fmtTime(img.timestamp));
                 trainingMeta.innerHTML = meta;
-            });
+            })
+            .catch(() => {});
     }
 
     function clearTraining() {
@@ -823,9 +848,8 @@
         const filename = trainingImage.dataset.filename;
         if (!filename || !trainingClass) return;
         if (!confirm('Permanently delete this training image?')) return;
-        fetch('/api/training/' + encodeURIComponent(trainingClass) + '/' +
+        api('/api/training/' + encodeURIComponent(trainingClass) + '/' +
             encodeURIComponent(filename), { method: 'DELETE' })
-            .then(r => r.json())
             .then(() => {
                 trainingTotal--;
                 if (trainingTotal <= 0) {
@@ -836,7 +860,8 @@
                 }
                 if (trainingOffset >= trainingTotal) trainingOffset = trainingTotal - 1;
                 loadTrainingImage();
-            });
+            })
+            .catch(() => {});
     }
 
     document.getElementById('training-delete').addEventListener('click', deleteTrainingImage);
