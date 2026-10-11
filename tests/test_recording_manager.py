@@ -1,6 +1,7 @@
 import io
 import json
 import subprocess
+import time
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -140,6 +141,34 @@ def test_delete_event_files_removes_media_and_sidecars(manager, tmp_path):
     assert not any((out / rel).exists() for rel in files.values())
     assert not (out / 'clean/event_x.json').exists()
     assert manager._delete_event_files({'event_id': 'x', 'clean_clip': 'clean/missing.mp4'}) == 0
+
+
+def test_retention_thread_survives_a_failing_pass_and_vanished_files(tmp_path, db, fake_ffmpeg, monkeypatch, caplog):
+    out = tmp_path / 'front_door'
+    mgr = RecordingManager(_config(days=1, check_interval=0.01), camera='front_door', output_dir=out, db=db)
+    old = datetime.now() - timedelta(days=2)
+    db.insert_event('old', old, camera='front_door', clean_clip='clean/event_old.mp4')  # clip already gone from disk
+    db.update_event_end('old', old + timedelta(seconds=5), 5.0, 1, 'person')
+
+    calls = {'n': 0}
+    real_query = db.get_events_before
+
+    def flaky(before):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise OSError('stale NFS file handle')
+        return real_query(before)
+
+    monkeypatch.setattr(db, 'get_events_before', flaky)
+    mgr.start()
+    deadline = time.time() + 5
+    while db.get_event('old') is not None and time.time() < deadline:
+        time.sleep(0.02)
+    mgr.stop()
+
+    assert db.get_event('old') is None
+    assert calls['n'] >= 2
+    assert 'retention pass failed' in caplog.text
 
 
 def test_per_label_cap_drops_oldest_events(tmp_path, db, fake_ffmpeg):

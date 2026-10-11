@@ -1,5 +1,6 @@
 """Orchestrates dual recording (clean + annotated), database, and retention."""
 
+import logging
 import subprocess
 import threading
 import time
@@ -14,6 +15,8 @@ from .clean_recorder import CleanRecorder
 from .config import RecordingConfig
 from .database import RecordingDatabase
 from .recorder import EventRecorder, RecorderState
+
+logger = logging.getLogger(__name__)
 
 # Best-snapshot scoring (Frigate-style): prefer big, confident, non-edge boxes.
 EDGE_MARGIN_FRAC = 0.02   # a box side within 2% of a border counts as "touching"
@@ -290,27 +293,44 @@ class RecordingManager:
             path = Path(rel) if Path(rel).is_absolute() else self.output_dir / rel
             targets = [path] if key in ('thumbnail', 'snapshot') else [path, path.with_suffix('.json')]
             for p in targets:
-                if p.exists():
-                    freed += p.stat().st_size
+                # The API's delete route and the per-label cap race this thread for the
+                # same files; a file that vanished in between is not an error.
+                try:
+                    size = p.stat().st_size
                     p.unlink()
+                except FileNotFoundError:
+                    continue
+                freed += size
         return freed
 
     def _retention_loop(self):
         while not self._retention_stop.wait(self.config.retention.check_interval):
-            cutoff = datetime.now() - timedelta(days=self.config.retention.days)
-            events = [
-                e for e in self.db.get_events_before(cutoff)
-                if (e.get('camera') or '') == self.camera
-            ]
-            for event in events:
-                self._delete_event_files(event)
-                self.db.delete_event(event['event_id'])
-            self._enforce_storage_limit()
+            try:
+                self._retention_pass()
+            except Exception:
+                logger.exception('[%s] retention pass failed; retrying next interval',
+                                 self.camera or 'default')
+
+    def _retention_pass(self):
+        cutoff = datetime.now() - timedelta(days=self.config.retention.days)
+        for event in self.db.get_events_before(cutoff):
+            if (event.get('camera') or '') != self.camera:
+                continue
+            self._delete_event_files(event)
+            self.db.delete_event(event['event_id'])
+        self._enforce_storage_limit()
 
     def _get_storage_bytes(self) -> int:
         if not self.output_dir.exists():
             return 0
-        return sum(f.stat().st_size for f in self.output_dir.rglob('*') if f.is_file())
+        total = 0
+        for f in self.output_dir.rglob('*'):
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except FileNotFoundError:
+                continue
+        return total
 
     def _enforce_storage_limit(self):
         max_gb = self.config.retention.max_storage_gb
