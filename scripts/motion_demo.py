@@ -56,7 +56,7 @@ def main():
     cap = cv2.VideoCapture(stream_url)
     if not cap.isOpened():
         print("ERROR: Could not open camera")
-        return
+        return 1
 
     motion_gating = True
     show_mask = False
@@ -65,11 +65,21 @@ def main():
     detections_run = 0
     detections_skipped = 0
     frame_times = []
+    misses = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
+            if cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
+                print("End of video")
+                break
+            misses += 1
+            if misses > 100:
+                print("ERROR: stream lost")
+                break
+            time.sleep(0.1)
             continue
+        misses = 0
 
         start = time.time()
         frame_count += 1
@@ -147,7 +157,8 @@ def main():
     print(f"  Detections skipped: {detections_skipped}")
     if total > 0:
         print(f"  Efficiency: {detections_skipped / total * 100:.1f}% saved")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

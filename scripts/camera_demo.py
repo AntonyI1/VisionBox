@@ -57,17 +57,29 @@ def main():
     cap = cv2.VideoCapture(stream_url)
     if not cap.isOpened():
         print("ERROR: Could not open camera")
-        return
+        return 1
 
     print("Press 'q' to quit, 'r' to reset tracks")
 
     frame_times = []
     track_classes = {}
+    misses = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
+            # A file reports its frame count and simply ends; a stream returns nothing
+            # for a while when it drops, so wait instead of spinning at 100% CPU.
+            if cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
+                print("End of video")
+                break
+            misses += 1
+            if misses > 100:
+                print("ERROR: stream lost")
+                break
+            time.sleep(0.1)
             continue
+        misses = 0
 
         start = time.time()
         det_array = detector.detect_array(frame, conf_threshold=args.conf, classes=class_filter)
@@ -104,7 +116,8 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

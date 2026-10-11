@@ -61,7 +61,7 @@ def main():
     cap = cv2.VideoCapture(int(source) if source.isdigit() else source)
     if not cap.isOpened():
         print(f"ERROR: Could not open {source}")
-        return
+        return 1
 
     track_class_info = {}
     track_last_capture = {}
@@ -69,6 +69,7 @@ def main():
     frame_count = 0
     class_counts = {}
     classes_seen = {}
+    misses = 0
 
     print(f"Output:   {output.resolve()}/")
     print(f"Confidence: {args.conf}")
@@ -84,7 +85,18 @@ def main():
         while True:
             ret, frame = cap.read()
             if not ret:
+                # A file ends; a dropped stream returns nothing for a while. Either way the
+                # summary below must still be written, so leave the loop instead of spinning.
+                if cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
+                    print("End of video")
+                    break
+                misses += 1
+                if misses > 100:
+                    print("ERROR: stream lost")
+                    break
+                time.sleep(0.1)
                 continue
+            misses = 0
 
             start = time.time()
             h, w = frame.shape[:2]
@@ -215,7 +227,8 @@ def main():
         print(f"  Dataset: {(output / 'dataset').resolve()}/")
         if classes_seen:
             print(f"  Classes: {output / 'dataset' / 'classes.txt'}")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
