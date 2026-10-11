@@ -222,6 +222,27 @@ def test_stream_fans_out_encoded_jpeg_and_releases_client_slot(client, state, mo
     assert view.stream_clients == 0
 
 
+def test_stream_sends_a_placeholder_until_the_camera_produces_a_frame(client, state, monkeypatch):
+    monkeypatch.setattr(api, '_STREAM_KEEPALIVE_S', 0.01)
+    view = api.CameraView(name='cam')  # offline since start-up: no frame was ever encoded
+    state.views['cam'] = view
+
+    resp = client.get('/api/cameras/cam/stream')
+    assert resp.status_code == 200
+    chunks = iter(resp.response)
+    assert next(chunks) == FRAME % api._OFFLINE_JPEG
+    assert next(chunks) == FRAME % api._OFFLINE_JPEG
+    assert view.stream_clients == 1
+
+    with view.frame_cond:
+        view.frame_jpeg, view.jpeg_version = b'JPEG1', 1
+        view.frame_cond.notify_all()
+    assert next(chunks) == FRAME % b'JPEG1'
+
+    resp.close()
+    assert view.stream_clients == 0
+
+
 # ----- Events -----
 
 def test_event_media_resolves_relative_to_camera_dir(client, state):

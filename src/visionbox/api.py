@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 # a stalled/offline camera would leak the worker thread + its stream_clients slot.
 _STREAM_KEEPALIVE_S = 2.0
 
+# Sent in place of a frame while a camera has produced none since start-up, for the
+# same reason: a generator that never yields never writes, so the headers never go out
+# and a viewer that gave up is never noticed.
+_OFFLINE_JPEG = cv2.imencode('.jpg', np.zeros((9, 16, 3), dtype=np.uint8))[1].tobytes()
+
 _IMAGE_SUFFIXES = ('.jpg', '.jpeg', '.png')
 _ZONE_NAME_RE = re.compile(r'[\w .-]{1,32}')
 
@@ -288,7 +293,7 @@ def create_app(state: CamerasState) -> Flask:
                 while True:
                     jpeg, last_sent = _next_jpeg(view, last_sent)
                     if jpeg is None:
-                        continue
+                        jpeg = _OFFLINE_JPEG
                     yield (
                         b'--frame\r\n'
                         b'Content-Type: image/jpeg\r\n\r\n'
