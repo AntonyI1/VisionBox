@@ -162,3 +162,4 @@ class EventRecorder:
     def release(self):
         if self.is_recording:
             self._stop_recording(time.time())
+        self.state = RecorderState.IDLE

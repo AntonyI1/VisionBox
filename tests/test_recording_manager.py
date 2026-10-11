@@ -112,6 +112,19 @@ def test_trigger_subset_drives_counts_and_count_now_gates_tallying(manager, db):
     assert row['detection_count'] == 1
 
 
+def test_abort_closes_the_event_and_the_annotated_recorder(manager, db):
+    manager.update(FRAME, None, triggered=True, detections=[_person()])
+    first = manager.event_id
+
+    manager.abort()
+
+    assert not manager.is_recording and manager.state == RecorderState.IDLE
+    assert db.get_event(first)['end_time'] is not None
+    manager.update(FRAME, None, triggered=False)  # the reconnect's first, quiet frame
+    assert not manager.is_recording
+    assert db.get_event_count() == 1
+
+
 def test_without_annotated_recorder_events_follow_cooldown_and_max_duration(tmp_path, db):
     cfg = _config()
     cfg.annotated.enabled = False

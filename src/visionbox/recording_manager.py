@@ -385,6 +385,19 @@ class RecordingManager:
             current -= self._delete_event_files(event)
             self.db.delete_event(event['event_id'])
 
+    def abort(self):
+        """Close the open event when the stream drops.
+
+        Releasing the annotated recorder matters: left mid-recording, its state would
+        restart an event on the first frame after reconnect, with a row pointing at the
+        previous event's clip.
+        """
+        if self.annotated:
+            self.annotated.release()
+        if self._current_event_id:
+            self._end_event()
+        self._timer_state = RecorderState.IDLE
+
     def stop(self):
         if self._current_event_id:
             self._end_event()

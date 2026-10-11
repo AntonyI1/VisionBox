@@ -313,8 +313,7 @@ class CameraPipeline:
         finally:
             # Finalize any open event on every exit path (stall/lost/exception) so a reconnect
             # or restart can't leave a NULL-end orphan with a runaway clean ffmpeg behind it.
-            if self.recording_mgr.is_recording:
-                self.recording_mgr._end_event()
+            self.recording_mgr.abort()
             cap.release()
         return True
 
